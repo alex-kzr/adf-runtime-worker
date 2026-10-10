@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adf-runtime-worker"
-version = "0.0.1"
-description = "ADF diagnostic foundation scaffold"
+version = "0.1.0"
+description = "ADF supervised WSL host execution and journaled Git operations"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["httpx==0.28.1", "redis==6.4.0", "jsonschema==4.25.1", "opentelemetry-sdk==1.37.0", "opentelemetry-exporter-otlp-proto-http==1.37.0"]
 
 [project.scripts]
 adf-worker = "adf_runtime_worker.cli:main"
@@ -17,3 +17,16 @@ where = ["src"]
 
 [tool.mypy]
 strict = true
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2", "ruff==0.14.0", "mypy==1.18.2", "types-jsonschema==4.25.1.20251009", "bandit==1.8.6"]
+
+[tool.ruff]
+line-length = 140
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "S"]
+ignore = ["S603", "S607"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["S101", "S311"]

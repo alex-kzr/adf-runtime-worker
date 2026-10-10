@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"fixture-codex-session"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"python -m unittest","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"approved\":true,\"findings\":[]}"}}
+{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":8,"cached_input_tokens":0}}

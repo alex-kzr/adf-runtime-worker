@@ -1,30 +1,52 @@
 # adf-runtime-worker
 
-Ubuntu WSL2 host CLI execution, worktrees and process supervision for ADF. This is an independent local Git repository and a pinned submodule of the ADF umbrella.
+ADF's Ubuntu WSL2 host execution service. It runs pinned Codex and Claude Code CLIs under the authenticated Linux user, consumes Redis Streams through a scoped API lease, supervises process groups, and owns task worktrees, checks, reviewed commits and serial integration. Provider authentication stays in the host home; this package has no Docker service.
 
-**Foundation scaffold, not a working MVP.** Read [module design](docs/development.md) for what exists and what remains. GitHub origin: [adf-runtime-worker](https://github.com/alex-kzr/adf-runtime-worker), supplied by the user and configured locally. Publication requires explicit user authorization; the matching adf-meta delivery report records publication and verification status.
+The runtime is implemented. **Whole MVP readiness still requires the matching umbrella acceptance report**, including live provider authorization, three parallel CLI jobs, restart/lease fault scenarios and external network isolation. Mock tests prove mechanics without claiming subscription execution.
 
-## Umbrella documentation
+## Run in Ubuntu WSL2
+
+Python 3.12.9 and uv 0.12.18 are the verified local tooling. Install the exact dependency lock in a virtual environment; the source checkout may be read from Windows, but target repositories, worktrees and runtime journals must be on Linux ext4.
+
+```sh
+uv venv --python 3.12.9 .venv
+uv pip install --python .venv/bin/python -r requirements.lock
+uv pip install --python .venv/bin/python --no-deps -e .
+.venv/bin/adf-worker doctor --root /home/your-user/ai-factory --node /absolute/path/to/node
+.venv/bin/adf-worker serve \
+  --root /home/your-user/ai-factory \
+  --project-root /home/your-user/ai-factory/projects \
+  --api-url http://127.0.0.1:8080 \
+  --token-file /home/your-user/ai-factory/config/worker-token \
+  --redis-url redis://adf_worker@127.0.0.1:6380/0 \
+  --redis-password-file /home/your-user/ai-factory/config/redis-worker-password \
+  --node /absolute/path/to/node \
+  --codex /absolute/path/to/codex --claude /absolute/path/to/claude
+```
+
+CLI version pins: Codex 0.157.0, Claude Code 2.1.296; the Codex JavaScript launcher also requires verified Node 24.21.0. `--node` adds only that configured executable directory to the sanitized Linux PATH. A mismatch blocks execution. Authenticate interactively using each provider's official CLI under the same regular Linux user; the worker does not log in, copy credentials or fall back to paid API access. Flags were checked against installed help on 2026-10-10. `doctor` uses official read-only auth status and emits only installation/auth readiness metadata. It also reports supplemental groups and Docker socket exposure without changing permissions. `execution_capabilities_available` is separate from `ready_for_real_execution`, which remains false until dedicated-account and umbrella acceptance gates are proved.
+
+## Development and evidence
+
+```sh
+uv pip install --python .venv/bin/python -r requirements-dev.lock
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check src tests
+.venv/bin/mypy src
+.venv/bin/bandit -r src -ll
+```
+
+Linux tests exercise real process groups and Git in temporary dedicated repositories. They cover output/time/lease quotas, stubborn descendants, redaction, path escape, exclusive locks, independent review, tree-bound checks, commit intent recovery, dependency snapshots, fresh repair attempts and integration conflict preservation. Live provider smoke belongs to umbrella acceptance, uses a dedicated trusted test repository and consumes the user's subscription only when authorized.
+
+Read [host runtime design and limitations](docs/development.md). The public origin is [adf-runtime-worker](https://github.com/alex-kzr/adf-runtime-worker).
+
+## Shared design
 
 - [Architecture](../../docs/architecture.md)
 - [Product and acceptance](../../docs/product.md)
 - [Contracts](../../docs/contracts.md)
 - [Security](../../docs/security.md)
-- [Backlog](../../docs/backlog.md)
 - [Local development](../../docs/local-development.md)
-- [Repository publication](../../docs/repositories.md)
+- [Delivery status](../../docs/delivery-status.md)
 
-These relative links work inside the initialized umbrella checkout. A standalone module clone contains its own `docs/development.md`; obtain the matching umbrella release for shared docs/contracts. The canonical umbrella is [adf-meta](https://github.com/alex-kzr/adf-meta), with [shared documentation](https://github.com/alex-kzr/adf-meta/tree/main/docs). These web links require the matching commits to be published.
-
-## Scaffold commands
-
-Run from this module directory (Python 3.12+; frontend Node 24 LTS / npm).
-
-```sh
-python -m pip install -e .
-python -m unittest discover -s tests
-adf-worker doctor
-adf-worker mock --request ../../packages/contracts/examples/execution-request.json
-```
-
-Run only the host worker in WSL2 for eventual real CLI execution; it is not a Compose service. Foundation mock/probe code never launches coding agents. For Python, use a local virtual environment; install commands do not change global packages when run there. No secret is required to validate/mock the scaffold.
+Relative links resolve in the initialized umbrella. A standalone clone must obtain the matching [adf-meta](https://github.com/alex-kzr/adf-meta) release for authoritative contracts and shared documentation.

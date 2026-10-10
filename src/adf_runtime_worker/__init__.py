@@ -1,2 +1,2 @@
-"""ADF foundation; operational MVP is not implemented."""
+"""ADF supervised host runtime; whole-system readiness requires acceptance gates."""
 __all__: list[str] = []
