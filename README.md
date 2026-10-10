@@ -2,7 +2,7 @@
 
 Ubuntu WSL2 host CLI execution, worktrees and process supervision for ADF. This is an independent local Git repository and a pinned submodule of the ADF umbrella.
 
-**Foundation scaffold, not a working MVP.** Read [module design](docs/development.md) for what exists and what remains. GitHub origin: [adf-runtime-worker](https://github.com/alex-kzr/adf-runtime-worker), supplied by the user and configured locally. Publication remains a user action; no push has been performed.
+**Foundation scaffold, not a working MVP.** Read [module design](docs/development.md) for what exists and what remains. GitHub origin: [adf-runtime-worker](https://github.com/alex-kzr/adf-runtime-worker), supplied by the user and configured locally. Publication requires explicit user authorization; the matching adf-meta delivery report records publication and verification status.
 
 ## Umbrella documentation
 
@@ -14,7 +14,7 @@ Ubuntu WSL2 host CLI execution, worktrees and process supervision for ADF. This 
 - [Local development](../../docs/local-development.md)
 - [Repository publication](../../docs/repositories.md)
 
-These relative links work inside the initialized umbrella checkout. A standalone module clone contains its own `docs/development.md`; obtain the matching umbrella release for shared docs/contracts. The canonical umbrella is [adf-meta](https://github.com/alex-kzr/adf-meta), with [shared documentation](https://github.com/alex-kzr/adf-meta/tree/main/docs). These web links become available after the user publishes the matching commits.
+These relative links work inside the initialized umbrella checkout. A standalone module clone contains its own `docs/development.md`; obtain the matching umbrella release for shared docs/contracts. The canonical umbrella is [adf-meta](https://github.com/alex-kzr/adf-meta), with [shared documentation](https://github.com/alex-kzr/adf-meta/tree/main/docs). These web links require the matching commits to be published.
 
 ## Scaffold commands
 
