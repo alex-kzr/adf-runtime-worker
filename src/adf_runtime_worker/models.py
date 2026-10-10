@@ -24,6 +24,12 @@ class Usage:
     provider_estimated_cost_usd: float | None = None
 
 @dataclass(frozen=True)
+class SkillSnapshot:
+    name: str
+    sha256: str
+    content: str = field(repr=False)
+
+@dataclass(frozen=True)
 class Request:
     execution_id: str
     run_id: str
@@ -47,6 +53,8 @@ class Request:
     correlation: Json = field(default_factory=dict)
     wall_deadline: float | None = None
     redaction_values: tuple[str, ...] = field(default=(), repr=False)
+    approved_skills: tuple[SkillSnapshot, ...] = ()
+    native_skill_config: Json = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class AdapterResult:

@@ -90,7 +90,7 @@ def within_root(path: Path, root: Path, *, must_exist: bool = True) -> Path:
 
 def validate_relative(path: str) -> str:
     candidate = Path(path)
-    if candidate.is_absolute() or not path or path != path.strip() or ".." in candidate.parts or "\\" in path or any(ord(char) < 32 for char in path):
+    if candidate.is_absolute() or not candidate.parts or not path or path != path.strip() or ".." in candidate.parts or "\\" in path or any(ord(char) < 32 for char in path):
         raise WorkerError("INVALID_PATH", "Unsafe relative path")
     if candidate.parts[0] == ".git" or _DENIED_NAMES.search(path):
         raise WorkerError("SECRET_DETECTED", "Generated or sensitive paths cannot be staged")

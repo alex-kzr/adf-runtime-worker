@@ -134,8 +134,8 @@ def test_mock_refuses_readonly_writes_and_symlink_parent_escape(tmp_path):
     assert not (outside / "file.txt").exists()
 
 
-def test_codex_refuses_narrow_tool_scope(tmp_path):
-    with pytest.raises(WorkerError, match="cannot enforce"):
+def test_codex_refuses_narrow_builtin_tool_scope(tmp_path):
+    with pytest.raises(WorkerError, match="built-in shell scope remains coarse"):
         CodexAdapter("codex").argv(Request("execution", "run", 1, allowed_tools=("Read",)), tmp_path)
 
 

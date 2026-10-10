@@ -1,7 +1,6 @@
 """Registered runtime operations; models never own Git commits or approval."""
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import sys
@@ -12,6 +11,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any, cast
 from .adapters import provider_adapter
+from .capabilities import scoped_mcp, skill_snapshot
 from .git_workspace import GitWorkspaceManager, Workspace
 from .models import EventSink, Json, Request, WorkerError
 from .process import ProcessRunner, disk_bytes
@@ -34,31 +34,15 @@ class Executor:
         if operation in {"review", "planner"}:
             profile = "observe"
         prompt = str(job.get("task_prompt", ""))
-        skill_texts: list[str] = []
-        for skill in agent.get("skills", []):
-            manifest = skill.get("manifest", skill)
-            path = within_root(Path(manifest["path"]), self.workspaces.root)
-            source = path / "SKILL.md" if path.is_dir() else path
-            within_root(source, self.workspaces.root)
-            raw = source.read_bytes()
-            if len(raw) > 32768 or hashlib.sha256(raw).hexdigest() != manifest.get("sha256", manifest.get("hash")):
-                raise WorkerError("VERSION_CONFLICT", "Skill content differs from approved manifest")
-            skill_texts.append(raw.decode("utf-8"))
+        skills = tuple(skill_snapshot(item, self.workspaces.root, self.secret_values) for item in agent.get("skills", []))
+        if len({skill.name for skill in skills}) != len(skills):
+            raise WorkerError("INVALID_REQUEST", "Approved skill names must be unique")
         mcp: Json = {}
         for item in agent.get("mcp_servers", []):
-            manifest = item.get("manifest", item)
-            if not manifest.get("trusted") or manifest.get("transport", "stdio") != "stdio" or not manifest.get("allowed_tools", manifest.get("tool_allowlist")):
-                raise WorkerError("PERMISSION_DENIED", "MCP requires trusted stdio and explicit tool allowlist")
-            argv = manifest.get("argv", [])
-            if not argv or any(not isinstance(arg, str) for arg in argv):
-                raise WorkerError("INVALID_REQUEST", "MCP command must be a registered argv list")
-            if Path(argv[0]).name in {"bash", "sh", "sudo", "docker", "cmd", "powershell", "pwsh"}:
-                raise WorkerError("PERMISSION_DENIED", "Shell/privileged MCP launchers are forbidden")
-            executable = shutil.which(argv[0]) or argv[0]
-            name = str(manifest.get("name", item.get("name", "")))
-            if not name or not name.replace("_", "").replace("-", "").isalnum():
-                raise WorkerError("INVALID_REQUEST", "MCP name is unsafe")
-            mcp[name] = {"command": executable, "args": argv[1:]}
+            name, config = scoped_mcp(item, workspace.path, max(1, int(self.execution_deadline - time.monotonic())))
+            if name in mcp:
+                raise WorkerError("INVALID_REQUEST", "MCP server names must be unique")
+            mcp[name] = config
         provider = agent.get("provider", "mock")
         mapped_tools: list[str] = []
         for item in agent.get("tools", []):
@@ -69,19 +53,29 @@ class Executor:
                 raise WorkerError("CAPABILITY_UNSUPPORTED", "Tool registry needs verified provider mappings")
             if profile != "trusted-development" and manifest.get("permission") != "read":
                 raise WorkerError("PERMISSION_DENIED", "Read-only role cannot inherit write/check tools")
+            if provider == "codex" and manifest.get("permission") != "read":
+                raise WorkerError("PERMISSION_DENIED", "Codex MCP registry requires read permission")
             mapped_tools.extend(selected)
-        if provider == "claude":
-            for item in agent.get("mcp_servers", []):
-                manifest = item.get("manifest", item)
-                name = str(manifest.get("name", item.get("name", "")))
-                mapped_tools.extend("mcp__" + name + "__" + str(tool) for tool in manifest.get("allowed_tools", manifest.get("tool_allowlist", [])))
+        if provider in {"codex", "claude"}:
+            for name, config in mcp.items():
+                names = {"mcp__" + name + "__" + tool for tool in config["enabled_tools"]}
+                if agent.get("tools"):
+                    selected = names.intersection(mapped_tools)
+                    # A typed MCP registry narrows a server's approved catalog; never broadens it.
+                    config["enabled_tools"] = [tool for tool in config["enabled_tools"] if "mcp__" + name + "__" + tool in selected]
+                    if not config["enabled_tools"]:
+                        raise WorkerError("PERMISSION_DENIED", "Assigned MCP has no selected registry tools")
+                else:
+                    mapped_tools.extend(sorted(names))
+            if provider == "codex" and any(tool not in {"mcp__" + name + "__" + tool for name, config in mcp.items() for tool in config["enabled_tools"]} for tool in mapped_tools):
+                raise WorkerError("CAPABILITY_UNSUPPORTED", "Codex narrow registry supports only assigned scoped MCP tools")
         provider_tools = mapped_tools if agent.get("tools") or agent.get("mcp_servers") else agent.get("allowed_tools", [])
         schema = _PLAN_SCHEMA if operation == "planner" else _REVIEW_SCHEMA if operation == "review" else None
         if schema:
             prompt += "\nReturn only JSON matching this schema: " + json.dumps(schema)
         trusted = "Work only in this allocated task snapshot. Do not commit, push, merge, alter Git refs, read credentials, or modify execution configuration. The worker performs registered checks and Git operations separately.\n"
-        prompt = str(job.get("task_prompt", "")) if agent.get("provider") == "mock" else trusted + str(agent.get("prompt", "")) + "\n" + "\n".join(skill_texts) + "\n" + prompt
-        return Request(str(job["execution_id"]), str(job["run_id"]), int(job["lease_epoch"]), workspace.path, prompt, max(1, min(1800, int(job.get("timeout_sec", 1800)), int(self.execution_deadline - time.monotonic()))), min(1000, int(job.get("max_steps", 1000))), min(20971520, int(job.get("max_output_bytes", 20971520))), min(5368709120, int(job.get("max_disk_bytes", 5368709120))), tuple(provider_tools), tuple(job.get("env_allowlist", [])), profile, agent.get("model"), agent.get("cli_version"), mcp, schema, self.workspaces.journal_for(str(job["execution_id"])).path, deadline, lock_fd, {key: job[key] for key in ("project_id", "task_id", "run_id", "node_run_id", "execution_id") if key in job}, self.execution_deadline, self.secret_values)
+        prompt = str(job.get("task_prompt", "")) if agent.get("provider") == "mock" else trusted + str(agent.get("prompt", "")) + "\n" + ("\n".join(skill.content for skill in skills) if agent.get("provider") != "codex" else "") + "\n" + prompt
+        return Request(str(job["execution_id"]), str(job["run_id"]), int(job["lease_epoch"]), workspace.path, prompt, max(1, min(1800, int(job.get("timeout_sec", 1800)), int(self.execution_deadline - time.monotonic()))), min(1000, int(job.get("max_steps", 1000))), min(20971520, int(job.get("max_output_bytes", 20971520))), min(5368709120, int(job.get("max_disk_bytes", 5368709120))), tuple(provider_tools), tuple(job.get("env_allowlist", [])), profile, agent.get("model"), agent.get("cli_version"), mcp, schema, self.workspaces.journal_for(str(job["execution_id"])).path, deadline, lock_fd, {key: job[key] for key in ("project_id", "task_id", "run_id", "node_run_id", "execution_id") if key in job}, self.execution_deadline, self.secret_values, skills)
 
     def run(self, job: Json, sink: EventSink, cancellation: Event, *, lease_deadline: Any = None) -> Json:
         from .telemetry import span, trace_id

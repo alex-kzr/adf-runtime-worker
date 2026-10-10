@@ -22,7 +22,7 @@ Integration sequentially applies task deltas to `factory/integration/<run>`, sta
 
 ## Provider policies and residual trust
 
-Codex 0.157.0 uses noninteractive JSONL, `--ignore-user-config`, `--ignore-rules`, `--ephemeral`, approval `never`, and read-only/workspace-write sandbox. Network is disabled for model shell execution. User MCP configuration is excluded. Compiled apps/browser/computer/image/hook/plugin/remote-plugin features are explicitly disabled; host skill discovery, automatic dependency installation and web search are disabled. Codex cannot promise a per-command shell allowlist through this adapter; trusted development is a coarse worktree sandbox grant. Scoped Codex MCP is currently refused with `CAPABILITY_UNSUPPORTED` until the exact settings/stream behavior are fixture-verified. An explicit request for unsupported narrow permissions must fail, not expand silently.
+Codex 0.157.0 uses noninteractive JSONL, `--ignore-user-config`, `--ignore-rules`, `--ephemeral`, approval `never`, and read-only/workspace-write sandbox. Network is disabled for model shell execution. User MCP configuration is excluded. Compiled apps/browser/computer/image/hook/plugin/remote-plugin features are explicitly disabled; host skill discovery, automatic dependency installation and web search are disabled. Codex cannot promise a per-command shell allowlist through this adapter; trusted development is a coarse worktree sandbox grant. Codex supports a narrow MCP tool catalog through verified 0.157.0 `mcp_servers.<name>.enabled_tools`, `required`, `startup_timeout_sec` and `tool_timeout_sec` configuration. `--strict-config` rejects unsupported configuration. The supported filesystem scope is the ADF-owned `adf.scoped-files.v1` stdio contract below. Its MCP tool allowlist is separate from the coarse built-in worktree/shell profile; it does not promise a shell command allowlist. Unsupported built-in mappings and generic server scope contracts fail without silently expanding rights. Login shells are disabled to avoid inheriting profile setup.
 
 Claude Code 2.1.296 uses `--restricted`, `--safe-mode`, empty setting sources, disabled hooks/skills, strict explicit MCP configuration, an explicit built-in/permission tool list and unattended permission prompts `none`. The installed `--restricted` mode confines file tools to working directories and rejects bypass. Unscoped Bash, child agents and network tools are forbidden; explicitly bounded `Bash(...)` rules are allowed only in trusted development. Safe-mode's explicit MCP interaction still requires live verification before claiming scoped MCP readiness. `--bare` is deliberately absent because installed help says it skips OAuth/keychain authentication, which conflicts with subscription use. No dangerous skip-permissions flag, paid fallback, login automation or credential copying is implemented.
 
@@ -48,8 +48,44 @@ Provider JSONL fixtures are bounded representative contract cases with no real c
 {"permission":"read","provider_mappings":{"claude":["Read","Glob","Grep"],"mock":[]}}
 ```
 
-The immutable API tool registry supplies provider mappings, not registry UUIDs as CLI tool names. Developer file writes can explicitly add `Edit`/`Write` with a write permission. Codex refuses nonempty narrow tool sets; choose its explicit coarse worktree permission profile with no narrow registry. MCP manifests use canonical `allowed_tools` and explicit trusted stdio argv. Safe-mode/explicit MCP subscription execution remains an open live acceptance gate.
+The immutable API tool registry supplies provider mappings, not registry UUIDs as CLI tool names. Developer file writes can explicitly add `Edit`/`Write` with a write permission. Codex mappings accept only exact `mcp__<assigned-server>__<allowlisted-tool>` names with read permission. Registry mappings narrow the assigned server catalog; they cannot add unassigned tools. Built-in Codex command tools still use its explicitly approved coarse worktree profile. Claude safe-mode/explicit MCP subscription execution remains a separate live acceptance gate.
 
 ## Local validation snapshot
 
-On 2026-10-10, Linux fixture tests covered the split development/check/review/commit pipeline, three unique task allocations, durable terminal/event replay, uncertain-before-ACK, dependency crash recovery, integration predecessor double-apply prevention, stopped group/lock proofs, guarded lock cancellation, streaming Git output caps, authoritative deadlines, check wire timeouts, included-hook refusal, mock symlink confinement, scoped Codex refusal and numeric usage/loaded-token redaction. This does not claim live three-provider-job acceptance or complete hostile-code isolation. Use the umbrella acceptance report for those gates.
+On 2026-10-10, Linux fixture tests covered the split development/check/review/commit pipeline, three unique task allocations, durable terminal/event replay, uncertain-before-ACK, dependency crash recovery, integration predecessor double-apply prevention, stopped group/lock proofs, guarded lock cancellation, streaming Git output caps, authoritative deadlines, check wire timeouts, included-hook refusal, mock symlink confinement, unsupported Codex built-in mapping refusal and numeric usage/loaded-token redaction. This does not claim live three-provider-job acceptance or complete hostile-code isolation. Use the umbrella acceptance report for those gates.
+
+
+## Approved instruction skills and scoped MCP
+
+Skills are instruction-only native Codex skills for this MVP. Store each approved `SKILL.md` under `<worker-root>/skills/<name>/`, with `name` and `description` frontmatter, and register its exact SHA-256. The worker checks canonical paths, symlinks, bounded UTF-8 content and known secrets before reading. Scripts, assets and `agents/openai.yaml` dependencies are not copied or executed under this contract. Hashing SKILL.md does not authorize unhashed adjacent files.
+
+The adapter temporarily materializes only approved bytes in the allocated worktree's `.agents/skills/<name>/SKILL.md`. Native `skills.config` enables those exact paths and disables unrelated discovered host/project skill documents; bundled skills are off. The task prompt invokes `$name` without duplicating the skill body. Existing repository content is never overwritten. Post-launch SHA validation and cleanup happen before staging; unexpected changes fail the execution and retain residual evidence. `skill_loaded` audit events contain only name, SHA and native/injected mode. Claude uses the same checked instruction bytes as an explicit prompt addition, pending its authentication gate.
+
+A supported MCP registry entry is:
+
+```json
+{
+  "name": "factoryfiles",
+  "manifest": {
+    "transport": "stdio",
+    "argv": ["python3", "-m", "adf_runtime_worker.scoped_mcp"],
+    "trusted": true,
+    "allowed_tools": ["read_marker"],
+    "scope": {
+      "contract": "adf.scoped-files.v1",
+      "root": "$WORKTREE",
+      "read_paths": ["marker.txt"],
+      "max_bytes": 4096
+    },
+    "timeout_sec": 2
+  }
+}
+```
+
+Its typed tool mapping is `{ "permission": "read", "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "additionalProperties": false }, "provider_mappings": { "codex": ["mcp__factoryfiles__read_marker"] } }`. The immutable definition name is the fallback MCP name; an explicit manifest name takes precedence. Server names must be unique and unambiguous.
+
+`read_marker` reads the single approved file by default; `read_file` requires an explicit approved `path`. Exact read paths contain no globs, traversal, credential/config names or symlinks. The worker launches its installed owned server with isolated Python `-I -m`; project modules, `sitecustomize` and Python environment paths cannot replace it. The owned server uses held directory descriptors and `O_NOFOLLOW` on each component, regular-file and single-link inode checks, bounded reads and an OS per-tool deadline. Codex receives only selected `enabled_tools` plus bounded startup/tool timeouts. The server also rejects excluded tool calls and out-of-scope arguments independently. Its catalog includes a side-effect-free forbidden canary to verify native catalog filtering; the worker never enables that canary. No env lookup, network, authentication, mutation, resources or prompt methods are implemented.
+
+Generic third-party MCP servers are not covered by this filesystem scope. `trusted: true` and a JSON `scope` alone do not confine an arbitrary subprocess; unsupported argv/contracts are refused until an independently verified implementation binds their access policy. This is an in-process worker capability, not another deployable service. The worker's existing user/group privilege limitations remain unchanged.
+
+The exact primary-source [Codex 0.157.0 config schema](https://github.com/openai/codex/blob/rust-v0.157.0/codex-rs/core/config.schema.json), [native skill configuration](https://github.com/openai/codex/blob/rust-v0.157.0/codex-rs/config/src/skills_config.rs), [skill root discovery](https://github.com/openai/codex/blob/rust-v0.157.0/codex-rs/ext/skills/src/host_roots.rs), and [exec MCP event schema](https://github.com/openai/codex/blob/rust-v0.157.0/codex-rs/exec/src/exec_events.rs) were checked on 2026-10-10. Tests retain a relevant official-schema subset with the full source SHA-256 and tag tree ID, and validate generated TOML against it. See also the [official MCP configuration reference](https://developers.openai.com/codex/mcp/) and [skills reference](https://developers.openai.com/codex/skills/). Live evidence is recorded separately; unit contracts alone do not prove a native provider run.

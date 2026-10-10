@@ -1,0 +1,384 @@
+{
+  "source": "https://raw.githubusercontent.com/openai/codex/rust-v0.157.0/codex-rs/core/config.schema.json",
+  "source_sha256": "17fbda7e71603aa6a83e986608f2e13c27ea46ce1a4b889196ba81a07c39d907",
+  "tag_tree_sha": "00c972ed5d6ff6499317fd41b7f23605b8e6850d",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "mcp_servers": {
+        "additionalProperties": {
+          "$ref": "#/definitions/RawMcpServerConfig"
+        },
+        "default": {},
+        "description": "Definition for MCP servers that Codex can reach out to for tool calls.",
+        "type": "object"
+      },
+      "skills": {
+        "allOf": [
+          {
+            "$ref": "#/definitions/SkillsConfig"
+          }
+        ],
+        "description": "User-level skill config entries keyed by SKILL.md path."
+      }
+    },
+    "definitions": {
+      "SkillsConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "bundled": {
+            "$ref": "#/definitions/BundledSkillsConfig"
+          },
+          "config": {
+            "items": {
+              "$ref": "#/definitions/SkillConfig"
+            },
+            "type": "array"
+          },
+          "include_instructions": {
+            "description": "Whether turns receive the automatic skills instructions block.",
+            "type": "boolean"
+          },
+          "max_context_tokens": {
+            "description": "Maximum tokens used by the available-skills catalog. Defaults to 2% of the model context window and is capped at 10,000 tokens when set.",
+            "format": "uint",
+            "minimum": 1.0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "SkillConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "name": {
+            "description": "Name-based selector.",
+            "type": "string"
+          },
+          "path": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/AbsolutePathBuf"
+              }
+            ],
+            "description": "Path-based selector."
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "AbsolutePathBuf": {
+        "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
+        "type": "string"
+      },
+      "BundledSkillsConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "RawMcpServerConfig": {
+        "additionalProperties": false,
+        "description": "Raw MCP config shape used for deserialization and supported-field JSON Schema generation.\n\nFields that are accepted only to produce targeted validation errors should be skipped in the generated schema.\n\nKeep `TryFrom<RawMcpServerConfig> for McpServerConfig` exhaustively destructuring this struct so new TOML fields cannot be added here without updating the validation/mapping logic that produces [`McpServerConfig`].",
+        "properties": {
+          "args": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "auth": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/McpServerAuth"
+              }
+            ],
+            "default": null
+          },
+          "bearer_token_env_var": {
+            "type": "string"
+          },
+          "command": {
+            "type": "string"
+          },
+          "cwd": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/LegacyAppPathString"
+              }
+            ],
+            "default": null
+          },
+          "default_tools_approval_mode": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/AppToolApproval"
+              }
+            ],
+            "default": null
+          },
+          "disabled_tools": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "default": null,
+            "type": "boolean"
+          },
+          "enabled_tools": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": null,
+            "type": "object"
+          },
+          "env_http_headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": null,
+            "type": "object"
+          },
+          "env_vars": {
+            "default": null,
+            "items": {
+              "$ref": "#/definitions/McpServerEnvVar"
+            },
+            "type": "array"
+          },
+          "environment_id": {
+            "default": null,
+            "type": "string"
+          },
+          "http_headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "http_headers_helper": {
+            "type": "string"
+          },
+          "name": {
+            "default": null,
+            "description": "Legacy display-name field accepted for backward compatibility.",
+            "type": "string"
+          },
+          "oauth": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/McpServerOAuthConfig"
+              }
+            ],
+            "default": null
+          },
+          "oauth_resource": {
+            "default": null,
+            "type": "string"
+          },
+          "omit_tools_from": {
+            "default": null,
+            "items": {
+              "$ref": "#/definitions/ToolExposureSurface"
+            },
+            "type": "array"
+          },
+          "required": {
+            "default": null,
+            "type": "boolean"
+          },
+          "scopes": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "startup_timeout_ms": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "startup_timeout_sec": {
+            "default": null,
+            "format": "double",
+            "type": "number"
+          },
+          "supports_parallel_tool_calls": {
+            "default": null,
+            "type": "boolean"
+          },
+          "tool_timeout_sec": {
+            "default": null,
+            "format": "double",
+            "type": "number"
+          },
+          "tools": {
+            "additionalProperties": {
+              "$ref": "#/definitions/McpServerToolConfig"
+            },
+            "default": null,
+            "type": "object"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "McpServerToolConfig": {
+        "additionalProperties": false,
+        "description": "Per-tool settings for a single MCP server tool.",
+        "properties": {
+          "approval_mode": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/AppToolApproval"
+              }
+            ],
+            "description": "Approval mode for this tool."
+          },
+          "output_token_limit": {
+            "description": "Token budget for this tool's output, before the standard 20% serialization allowance.",
+            "format": "uint",
+            "minimum": 1.0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "AppToolApproval": {
+        "enum": [
+          "auto",
+          "prompt",
+          "writes",
+          "approve"
+        ],
+        "type": "string"
+      },
+      "ToolExposureSurface": {
+        "description": "A model-facing surface on which a tool can be exposed.",
+        "oneOf": [
+          {
+            "description": "Nested tools available to Code Mode scripts.",
+            "enum": [
+              "code_mode"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Tools discovered later through tool search.",
+            "enum": [
+              "deferred"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Tools present in the model's initial tool list.",
+            "enum": [
+              "direct"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "McpServerOAuthConfig": {
+        "additionalProperties": false,
+        "description": "Client settings for MCP OAuth login or enterprise token exchange.",
+        "properties": {
+          "authorization_server_issuer": {
+            "description": "Expected resource authorization server issuer for EMA token exchange.",
+            "type": "string"
+          },
+          "callback_port": {
+            "description": "Fixed callback port that takes precedence over Codex's global OAuth callback port.",
+            "format": "uint16",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "callback_url": {
+            "description": "Registered callback URL associated with this OAuth client.",
+            "type": "string"
+          },
+          "client_id": {
+            "description": "Explicit OAuth client identifier to present during authorization and token exchange.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "McpServerEnvVar": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "LegacyAppPathString": {
+        "type": "string"
+      },
+      "McpServerAuth": {
+        "description": "Authentication flow for an HTTP MCP server. Explicit credentials take precedence for OAuth and ChatGPT; EMA rejects alternate credentials and fallback.",
+        "oneOf": [
+          {
+            "description": "Use stored MCP OAuth credentials when available. Starting an OAuth login is a separate operation.",
+            "enum": [
+              "oauth"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Use the current ChatGPT session for servers on the trusted first-party ChatGPT origin. If no ChatGPT session provider is available, startup can still fall back to stored OAuth credentials.",
+            "enum": [
+              "chatgpt"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Exchange an enterprise IdP refresh token for resource-specific authorization. Alternate credentials and ordinary OAuth fallback are not permitted.",
+            "enum": [
+              "ema_auth"
+            ],
+            "type": "string"
+          }
+        ]
+      }
+    }
+  }
+}
