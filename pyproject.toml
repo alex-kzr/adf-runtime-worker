@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adf-runtime-worker"
+version = "0.0.1"
+description = "ADF diagnostic foundation scaffold"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+adf-worker = "adf_runtime_worker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.mypy]
+strict = true
