@@ -28,6 +28,8 @@ CLI version pins: Codex 0.157.0, Claude Code 2.1.296; the Codex JavaScript launc
 
 ## Development and evidence
 
+The default provider profile is the worker Linux user's stable home, independent of job worktrees. An operator can select existing private profiles with `serve --codex-home /home/your-user/.codex --claude-config-dir /home/your-user/.claude`. Explicit directories must be owned, canonical Linux paths below that home, mode 0700 and outside worktrees. The worker passes only the corresponding directory selector, never OAuth values. It does not create a login/token, copy Windows auth, or log in per job. Job `env_allowlist` cannot select profiles or inject secret variables. Missing explicit directories fail with `AUTH_REQUIRED`. These profile flags do not themselves make concurrent Codex refresh safe; shared app-server ownership is a separate backend change.
+
 ```sh
 uv pip install --python .venv/bin/python -r requirements-dev.lock
 .venv/bin/python -m pytest -q

@@ -60,6 +60,8 @@ def main() -> None:
     serve.add_argument("--node", default=os.getenv("ADF_NODE_PATH", str(Path.home() / ".local" / "bin" / "node")))
     serve.add_argument("--codex", default=os.getenv("ADF_CODEX_PATH"))
     serve.add_argument("--claude", default=os.getenv("ADF_CLAUDE_PATH"))
+    serve.add_argument("--codex-home", type=Path, help="Existing private persistent Codex profile; no login or credential copy")
+    serve.add_argument("--claude-config-dir", type=Path, help="Existing private persistent Claude profile; no token generation")
     supervise = sub.add_parser("supervise", help=argparse.SUPPRESS)
     supervise.add_argument("--ticket", type=Path, required=True)
     args = parser.parse_args()
@@ -76,7 +78,7 @@ def main() -> None:
         elif args.command == "serve":
             if not args.token_file or not args.redis_password_file:
                 raise WorkerError("AUTH_REQUIRED", "Separate worker token and Redis password files are required")
-            WorkerService(args.root, args.api_url, args.token_file, args.redis_url, args.redis_password_file, max_parallel=args.max_parallel, provider_paths={key: value for key, value in {"codex": args.codex, "claude": args.claude}.items() if value}, project_roots=args.project_root).run()
+            WorkerService(args.root, args.api_url, args.token_file, args.redis_url, args.redis_password_file, max_parallel=args.max_parallel, provider_paths={key: value for key, value in {"codex": args.codex, "claude": args.claude}.items() if value}, provider_profiles={key: str(value) for key, value in {"codex": args.codex_home, "claude": args.claude_config_dir}.items() if value}, project_roots=args.project_root).run()
         else:
             body = json.loads(args.request.read_text(encoding="utf-8"))
             sequence = 0

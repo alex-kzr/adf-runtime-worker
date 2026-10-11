@@ -21,9 +21,10 @@ _PLAN_SCHEMA: Json = {"type": "object", "additionalProperties": False, "properti
 _REVIEW_SCHEMA: Json = {"type": "object", "additionalProperties": False, "properties": {"approved": {"type": "boolean"}, "findings": {"type": "array", "items": {"type": "string"}}}, "required": ["approved", "findings"]}
 
 class Executor:
-    def __init__(self, root: Path, *, require_ext4: bool = True, provider_paths: dict[str, str] | None = None) -> None:
+    def __init__(self, root: Path, *, require_ext4: bool = True, provider_paths: dict[str, str] | None = None, provider_profiles: dict[str, str] | None = None) -> None:
         self.workspaces = GitWorkspaceManager(root, require_ext4=require_ext4)
         self.provider_paths = provider_paths or {}
+        self.provider_profiles = provider_profiles or {}
         self.execution_deadline = float("inf")
         self.secret_values: tuple[str, ...] = ()
 
@@ -151,7 +152,8 @@ class Executor:
                 elif operation == "agent_task":
                     workspace.journal.update(developer_id=job.get("agent", {}).get("agent_id", job.get("agent", {}).get("id")), developer_config_version_id=job.get("agent", {}).get("config_version_id"), allowed_write_paths=allowed_paths)
                 provider = job.get("agent", {}).get("provider", "mock")
-                adapter = provider_adapter(provider, self.provider_paths.get(provider))
+                profile = self.provider_profiles.get(provider)
+                adapter = provider_adapter(provider, self.provider_paths.get(provider), Path(profile) if profile else None)
                 outcome = adapter.execute(request, sink, cancellation)
                 evidence.update(status=outcome.status, exit_code=outcome.exit_code, error_code=outcome.error_code, process_identity=outcome.process_identity, process_stopped=outcome.process_stopped, usage=asdict(outcome.usage))
                 if self.workspaces.git(workspace.path, "rev-parse", "HEAD") != before_head:

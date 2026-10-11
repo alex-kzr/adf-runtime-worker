@@ -183,7 +183,7 @@ def supervise_ticket(ticket: Path) -> None:
     saved = Journal(ticket).read()
     config = saved["worker_config"]
     root = Path(config["root"])
-    executor = Executor(root, provider_paths=config.get("provider_paths", {}))
+    executor = Executor(root, provider_paths=config.get("provider_paths", {}), provider_profiles=config.get("provider_profiles", {}))
     journal = Journal(ticket)
     with FileLock(root / "locks" / f"slot-{config['slot']}.lock"):
         with ApiClient(config["api_url"], Path(config["token_file"]), config["worker_id"]) as ledger:

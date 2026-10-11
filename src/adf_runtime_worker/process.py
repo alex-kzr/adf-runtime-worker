@@ -13,6 +13,7 @@ from .models import Json
 from .journal import Journal, group_alive, process_identity, stop_owned_session
 from .models import AdapterResult, Request, WorkerError
 from .security import Redactor, restricted_env
+from .profiles import ProviderProfile
 
 LineSink = Callable[[str, str], None]
 
@@ -56,9 +57,9 @@ class ProcessRunner:
             return False
         return not group_alive(self.identity) if os.name == "posix" else process.poll() is not None
 
-    def run(self, argv: list[str], request: Request, sink: LineSink, cancellation: Event, *, stdin_text: str = "") -> AdapterResult:
+    def run(self, argv: list[str], request: Request, sink: LineSink, cancellation: Event, *, stdin_text: str = "", profile: ProviderProfile | None = None) -> AdapterResult:
         try:
-            return self._run(argv, request, sink, cancellation, stdin_text=stdin_text)
+            return self._run(argv, request, sink, cancellation, stdin_text=stdin_text, profile=profile)
         finally:
             if self.process is not None:
                 self.stop()
@@ -66,7 +67,7 @@ class ProcessRunner:
                     if stream and not stream.closed:
                         stream.close()
 
-    def _run(self, argv: list[str], request: Request, sink: LineSink, cancellation: Event, *, stdin_text: str = "") -> AdapterResult:
+    def _run(self, argv: list[str], request: Request, sink: LineSink, cancellation: Event, *, stdin_text: str = "", profile: ProviderProfile | None = None) -> AdapterResult:
         self.redactor = Redactor(tuple(self.redactor.values) + request.redaction_values)
         if request.workspace_path is None:
             raise WorkerError("INVALID_PATH", "Process cwd must be an allocated worktree")
@@ -78,7 +79,10 @@ class ProcessRunner:
             journal.ensure_process_capacity()
             journal.update(phase="spawn_intent", supervisor=process_identity(os.getpid()), argv_executable=Path(argv[0]).name)
         pass_fds = (request.lock_fd,) if os.name == "posix" and request.lock_fd is not None else ()
-        self.process = subprocess.Popen(argv, cwd=request.workspace_path, env=restricted_env(request.env_allowlist), shell=False, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=os.name == "posix", pass_fds=pass_fds)
+        environment = restricted_env(request.env_allowlist)
+        if profile:
+            environment.update(profile.environment(request.workspace_path))
+        self.process = subprocess.Popen(argv, cwd=request.workspace_path, env=environment, shell=False, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=os.name == "posix", pass_fds=pass_fds)
         self.identity = process_identity(self.process.pid)
         if journal:
             journal.record_process(self.identity, phase="running", started_at=time.time())

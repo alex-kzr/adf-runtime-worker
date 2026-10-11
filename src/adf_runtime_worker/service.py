@@ -25,9 +25,9 @@ STREAM = "adf:executions"
 GROUP = "adf-workers"
 
 class WorkerService:
-    def __init__(self, root: Path, api_url: str, token_file: Path, redis_url: str, redis_password_file: Path, *, worker_id: str | None = None, max_parallel: int = 3, provider_paths: dict[str, str] | None = None, project_ids: list[str] | None = None, project_roots: list[Path] | None = None) -> None:
+    def __init__(self, root: Path, api_url: str, token_file: Path, redis_url: str, redis_password_file: Path, *, worker_id: str | None = None, max_parallel: int = 3, provider_paths: dict[str, str] | None = None, provider_profiles: dict[str, str] | None = None, project_ids: list[str] | None = None, project_roots: list[Path] | None = None) -> None:
         self.root = canonical_root(root)
-        self.executor = Executor(self.root, provider_paths=provider_paths)
+        self.executor = Executor(self.root, provider_paths=provider_paths, provider_profiles=provider_profiles)
         if max_parallel < 1 or max_parallel > 3:
             raise WorkerError("QUOTA_EXCEEDED", "Worker concurrency must be between one and three")
         self.max_parallel = max_parallel
@@ -48,7 +48,7 @@ class WorkerService:
             raise WorkerError("PERMISSION_DENIED", "Redis requires loopback and a separate password file")
         self.redis = redis.Redis(host=parsed.hostname, port=parsed.port or 6380, username=parsed.username or "adf_worker", password=redis_password_file.read_text().strip(), db=int(parsed.path.strip("/") or 0), decode_responses=True, socket_timeout=3, socket_connect_timeout=3)
         self.api = ApiClient(api_url, token_file, self.worker_id)
-        self.config: Json = {"root": str(self.root), "api_url": api_url, "token_file": str(token_file.resolve()), "worker_id": worker_id, "provider_paths": provider_paths or {}, "redis_password_file": str(redis_password_file.resolve())}
+        self.config: Json = {"root": str(self.root), "api_url": api_url, "token_file": str(token_file.resolve()), "worker_id": worker_id, "provider_paths": provider_paths or {}, "provider_profiles": provider_profiles or {}, "redis_password_file": str(redis_password_file.resolve())}
         self.project_ids = project_ids or []
         self.stopping = Event()
         self.children: dict[str, subprocess.Popen[bytes]] = {}
@@ -165,7 +165,7 @@ class WorkerService:
                 except redis.ResponseError as exc:
                     if "BUSYGROUP" not in str(exc):
                         raise
-                providers = {name: provider_adapter(name, self.config["provider_paths"].get(name)).probe() for name in ("codex", "claude", "mock")}
+                providers = {name: provider_adapter(name, self.config["provider_paths"].get(name), Path(self.config["provider_profiles"][name]) if name in self.config["provider_profiles"] else None).probe() for name in ("codex", "claude", "mock")}
                 self.api.register(self.root, {"providers": providers, "hostname": socket.gethostname(), "contract_version": "1", "operations": ["repo_inspect", "planner", "agent_task", "test", "review", "git_commit", "integrate"]}, self.project_ids, self.project_roots)
                 if os.name == "posix":
                     signal.signal(signal.SIGTERM, lambda *_: self.stopping.set())

@@ -19,6 +19,7 @@ from .process import ProcessRunner
 from .capabilities import toml_value
 from .native_skills import native_skills
 from .security import restricted_env
+from .profiles import ProviderProfile
 
 __all__ = ["Adapter", "Request", "Usage", "MockAdapter", "CodexAdapter", "ClaudeAdapter", "provider_adapter"]
 CODEX_VERSION = "0.157.0"
@@ -147,10 +148,14 @@ class SubprocessAdapter:
     pinned_version = ""
     executable_name = ""
 
-    def __init__(self, executable: str | None = None) -> None:
+    def __init__(self, executable: str | None = None, profile: ProviderProfile | None = None) -> None:
         self.executable = executable or shutil.which(self.executable_name)
+        self.profile = profile or ProviderProfile(self.provider)
         self.runner = ProcessRunner()
         self.usage = Usage()
+
+    def environment(self) -> dict[str, str]:
+        return {**restricted_env(), **self.profile.environment()}
 
     def probe(self, deadline: float | None = None) -> Json:
         if not self.executable:
@@ -161,14 +166,14 @@ class SubprocessAdapter:
                 uses_node = executable_file.read(64).startswith(b"#!/usr/bin/env node")
             if self.provider == "codex" and uses_node:
                 node = Path(os.getenv("ADF_NODE_PATH", str(Path.home() / ".local" / "bin" / "node")))
-                node_version = subprocess.run([str(node), "--version"], capture_output=True, text=True, timeout=5, shell=False, env=restricted_env()).stdout.strip()
+                node_version = subprocess.run([str(node), "--version"], capture_output=True, text=True, timeout=5, shell=False, env=self.environment()).stdout.strip()
                 runtime = {"node_path": str(node), "node_version": node_version, "node_pin_matches": node_version == "v" + NODE_VERSION}
                 if not runtime["node_pin_matches"]:
                     return {"provider": self.provider, "installed": True, "health": "blocked", "auth": "unknown", "runtime": runtime, "error_code": "RUNTIME_VERSION_MISMATCH"}
-            version = subprocess.run([self.executable, "--version"], capture_output=True, text=True, timeout=max(0.1, min(5.0, deadline - time.monotonic())) if deadline else 5, shell=False, env=restricted_env()).stdout.strip()
+            version = subprocess.run([self.executable, "--version"], capture_output=True, text=True, timeout=max(0.1, min(5.0, deadline - time.monotonic())) if deadline else 5, shell=False, env=self.environment()).stdout.strip()
             pin_matches = bool(re.search(r"(?<![\d.])" + re.escape(self.pinned_version) + r"(?![\d.])", version))
             auth_argv = [self.executable, "login", "status"] if self.provider == "codex" else [self.executable, "auth", "status"]
-            auth = subprocess.run(auth_argv, capture_output=True, text=True, timeout=max(0.1, min(10.0, deadline - time.monotonic())) if deadline else 10, shell=False, env=restricted_env())
+            auth = subprocess.run(auth_argv, capture_output=True, text=True, timeout=max(0.1, min(10.0, deadline - time.monotonic())) if deadline else 10, shell=False, env=self.environment())
             auth_ok = auth.returncode == 0
             if self.provider == "claude":
                 auth_ok = auth_ok and bool(json.loads(auth.stdout).get("loggedIn"))
@@ -204,7 +209,7 @@ class SubprocessAdapter:
                 normalizer = JsonNormalizer(self.provider, event_sink, request.max_steps, request.correlation, {(name, tool) for name, config in request.mcp_config.items() for tool in config["enabled_tools"]})
                 from .telemetry import span
                 with span("cli.session", {**request.correlation, "execution_id": request.execution_id, "run_id": request.run_id, "provider": self.provider}):
-                    result = self.runner.run(argv, effective, normalizer.line, cancellation, stdin_text=prompt)
+                    result = self.runner.run(argv, effective, normalizer.line, cancellation, stdin_text=prompt, profile=self.profile)
             self.usage = normalizer.usage
             if result.status == "succeeded" and (not normalizer.terminal or normalizer.failed):
                 result = replace(result, status="failed", error_code="MISSING_PROVIDER_SUCCESS")
@@ -304,11 +309,11 @@ class MockAdapter:
     def collect_usage(self) -> Usage:
         return Usage()
 
-def provider_adapter(provider: str, executable: str | None = None) -> Adapter:
+def provider_adapter(provider: str, executable: str | None = None, profile_path: Path | None = None) -> Adapter:
     if provider == "codex":
-        return CodexAdapter(executable)
+        return CodexAdapter(executable, ProviderProfile(provider, profile_path))
     if provider == "claude":
-        return ClaudeAdapter(executable)
+        return ClaudeAdapter(executable, ProviderProfile(provider, profile_path))
     if provider == "mock":
         return MockAdapter()
     raise WorkerError("CAPABILITY_UNSUPPORTED", "Unknown CLI provider")
