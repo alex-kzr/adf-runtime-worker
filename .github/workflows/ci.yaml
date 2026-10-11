@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: 3.12.9
       - run: python -m pip install -r requirements-dev.lock
-      - run: python -m pip install --no-deps -e .
+      - run: python -m pip install --no-deps .
       - name: Prepare pinned public native fixtures (no model execution)
         run: |
           npm install --prefix "$RUNNER_TEMP/adf-codex-fixture" --ignore-scripts --no-audit --no-fund @openai/codex@0.157.0

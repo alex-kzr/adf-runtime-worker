@@ -32,6 +32,9 @@ def command(params, *, owner_startup=False):
     home = root / "native-metadata-home"
     home.mkdir(mode=0o700, exist_ok=True)
     outer = [str(bwrap), "--unshare-all", "--unshare-user", "--die-with-parent", "--new-session", "--clearenv", "--cap-drop", "ALL"]
+    # Mount private tmpfs first: a later /tmp mount would hide CI synthetic
+    # workspaces (and public QA runtimes) located beneath /tmp.
+    outer += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]  # noqa: S108
     for system in ("/usr/bin", "/usr/lib", "/usr/lib64"):
         outer += ["--ro-bind", system, system]
     # Public fresh QA venv + public interpreter only, for the owned stdio MCP.
@@ -40,7 +43,7 @@ def command(params, *, owner_startup=False):
     for source, target in (("usr/bin", "/bin"), ("usr/lib", "/lib"), ("usr/lib64", "/lib64")):
         outer += ["--symlink", source, target]
     # Private namespace tmpfs only, never a shared host temp directory.
-    outer += ["--bind", str(root), str(root), "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", params["cwd"]]  # noqa: S108
+    outer += ["--bind", str(root), str(root), "--chdir", params["cwd"]]
     for key, value in {"HOME": str(home), "CODEX_HOME": str(profile), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
                        "DISABLE_UPDATES": "1", "PYTHONDONTWRITEBYTECODE": "1"}.items():
         outer += ["--setenv", key, value]
