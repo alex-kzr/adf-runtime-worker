@@ -12,7 +12,7 @@ from uuid import uuid4
 from typing import cast
 from .client import ApiClient, Ledger
 from .executor import Executor
-from .journal import FileLock, Journal, group_alive, process_identity, same_process
+from .journal import FileLock, Journal, owned_sessions_stopped, process_identity, process_stopped
 from .models import Json, WorkerError
 from .security import Redactor
 
@@ -113,7 +113,7 @@ class ExecutionSupervisor:
             try:
                 result = self.executor.run(job, sink, self.cancellation, lease_deadline=lambda: monitor.deadline)
             except WorkerError as exc:
-                result = {"status": "uncertain" if exc.code in {"EXECUTION_UNCERTAIN", "LEASE_STALE", "LEASE_LOST", "GIT_TIMEOUT"} else "cancelled" if exc.code == "CANCEL_REQUESTED" else "failed", "error_code": exc.code, "process_stopped": not group_alive(self.journal.read().get("process", {}))}
+                result = {"status": "uncertain" if exc.code in {"EXECUTION_UNCERTAIN", "LEASE_STALE", "LEASE_LOST", "GIT_TIMEOUT"} else "cancelled" if exc.code == "CANCEL_REQUESTED" else "failed", "error_code": exc.code, "process_stopped": owned_sessions_stopped(self.journal.read())}
                 if exc.code in {"CANCEL_REQUESTED", "LEASE_LOST", "LEASE_STALE", "GIT_TIMEOUT", "EXECUTION_TIMEOUT"}:
                     try:
                         target = str(job.get("target_execution_id") or execution_id)
@@ -127,7 +127,9 @@ class ExecutionSupervisor:
                     result.update(branch=data.get("workspace", {}).get("branch"), worktree_key=target, conflicting_paths=[path for intent in data.get("delta_intents", {}).values() for path in intent.get("conflicting_paths", [])])
             except Exception:
                 # Exception descriptions can contain paths, prompts or secrets.
-                result = {"status": "uncertain", "error_code": "SUPERVISOR_FAILED", "process_stopped": not group_alive(self.journal.read().get("process", {}))}
+                result = {"status": "uncertain", "error_code": "SUPERVISOR_FAILED", "process_stopped": owned_sessions_stopped(self.journal.read())}
+            if not result.get("process_stopped", True):
+                result["status"] = "uncertain"
             if monitor.failure:
                 result.update(status="uncertain", error_code=monitor.failure)
             if self.cancellation.is_set() and result.get("process_stopped"):
@@ -138,6 +140,8 @@ class ExecutionSupervisor:
                     result["artifacts"] = self._artifacts(job, result, execution_id, epoch)
                 except WorkerError as exc:
                     result.update(status="failed", error_code=exc.code)
+            if not owned_sessions_stopped(self.journal.read()):
+                result.update(status="uncertain", process_stopped=False, error_code="EXECUTION_UNCERTAIN")
             self.journal.update(terminal_result=result, phase="result_intent")
             try:
                 response = self.ledger.result(execution_id, epoch, result["status"], result)
@@ -168,8 +172,8 @@ class ExecutionSupervisor:
 
 def stopped_proof(journal: Journal, executor: Executor) -> Json:
     saved = journal.read()
-    if same_process(saved.get("supervisor", {})) or group_alive(saved.get("process", {})):
-        raise WorkerError("EXECUTION_UNCERTAIN", "Supervisor or CLI group still alive")
+    if not process_stopped(saved.get("supervisor", {})) or not owned_sessions_stopped(saved):
+        raise WorkerError("EXECUTION_UNCERTAIN", "Supervisor or owned CLI/Git session still alive")
     target = str(saved.get("request", {}).get("target_execution_id") or saved["execution_id"])
     with executor.workspaces.worktree_lock(target):
         identity = saved.get("supervisor", {})

@@ -230,9 +230,9 @@ class CodexAdapter(SubprocessAdapter):
             raise WorkerError("CAPABILITY_UNSUPPORTED", "Codex narrow registry supports assigned scoped MCP tools; built-in shell scope remains coarse")
         sandbox = "workspace-write" if request.permission_profile == "trusted-development" else "read-only"
         argv = [str(self.executable), "-a", "never", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config", "--json", "--color", "never", "--sandbox", sandbox, "-c", "sandbox_workspace_write.network_access=false", "-c", "features.multi_agent=false"]
-        for feature in ("apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use", "image_generation", "in_app_browser", "hooks", "plugins", "remote_plugin", "skill_search", "skill_mcp_dependency_install", "workspace_dependencies", "daemon_auto_start", "auth_elicitation", "code_mode_host"):
+        for feature in ("apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use", "image_generation", "in_app_browser", "hooks", "plugins", "remote_plugin", "skill_search", "skill_mcp_dependency_install", "workspace_dependencies", "daemon_auto_start", "auth_elicitation"):
             argv += ["-c", "features." + feature + "=false"]
-        argv += ["-c", "features.skip_host_skill_discovery=" + ("false" if request.native_skill_config else "true"), "-c", "skills.bundled.enabled=false", "-c", 'web_search="disabled"', "-c", "allow_login_shell=false"]
+        argv += ["-c", "features.code_mode_host=true", "-c", "features.skip_host_skill_discovery=" + ("false" if request.native_skill_config else "true"), "-c", "skills.bundled.enabled=false", "-c", 'web_search="disabled"', "-c", "allow_login_shell=false"]
         if request.native_skill_config:
             argv += ["-c", "skills=" + toml_value(request.native_skill_config)]
         for name, config in _mcp_launch_configs(request, config_dir).items():

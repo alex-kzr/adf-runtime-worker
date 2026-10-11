@@ -49,7 +49,7 @@ def service_fixture(repository):
 def journal_fixture(service, status="succeeded", persisted=False):
     execution_id = str(uuid4())
     journal = service.executor.workspaces.journal_for(execution_id)
-    journal.update(execution_id=execution_id, epoch=1, worker_config={"worker_id": service.worker_id}, redis_message_id="1-0", supervisor={"pid": 999999999, "start_ticks": 1}, terminal_result={"status": status, "process_stopped": True}, result_persisted=persisted, terminal_persisted=False)
+    journal.update(execution_id=execution_id, epoch=1, worker_config={"worker_id": service.worker_id}, redis_message_id="1-0", supervisor={"pid": 999999999, "start_ticks": 1, "pgid": 999999999, "session_id": 999999999}, terminal_result={"status": status, "process_stopped": True}, result_persisted=persisted, terminal_persisted=False)
     return journal
 
 

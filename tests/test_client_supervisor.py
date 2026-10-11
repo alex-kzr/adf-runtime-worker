@@ -89,6 +89,6 @@ def test_reconcile_refuses_a_live_supervisor(repository, job):
 def test_reconcile_accepts_dead_identity_with_reacquired_worktree_lock(repository, job):
     executor = Executor(repository[0], require_ext4=False)
     journal = executor.workspaces.journal_for(job["execution_id"])
-    journal.update(execution_id=job["execution_id"], supervisor={"pid": 999999999, "start_ticks": 1})
+    journal.update(execution_id=job["execution_id"], supervisor={"pid": 999999999, "start_ticks": 1, "pgid": 999999999, "session_id": 999999999})
     proof = stopped_proof(journal, executor)
     assert proof["worktree_lock_reacquired"] is True

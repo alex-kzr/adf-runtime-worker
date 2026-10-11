@@ -125,6 +125,28 @@ def test_codex_exact_scoped_overlay_toml_and_tool_audit(repository, tmp_path):
         normalizer.line("stdout", json.dumps(event))
 
 
+@pytest.mark.parametrize("profile", ["observe", "trusted-development"])
+def test_native_codex_tools_keep_pinned_host_and_scoped_catalog(profile, repository, tmp_path):
+    name, config = scoped_mcp(manifest(), repository[1], 180)
+    request = Request("exec", "run", 1, workspace_path=repository[1], permission_profile=profile, mcp_config={name: config}, allowed_tools=("mcp__factoryfiles__read_marker",))
+    argv = CodexAdapter("codex").argv(request, tmp_path)
+    overrides = {argv[index + 1].split("=", 1)[0]: argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "-c"}
+    # Real native trial showed conversational success with zero tools when this was false.
+    assert overrides["features.code_mode_host"] == "features.code_mode_host=true"
+    assert overrides["features.daemon_auto_start"] == "features.daemon_auto_start=false"
+    assert overrides["features.hooks"] == "features.hooks=false"
+    assert overrides["features.plugins"] == "features.plugins=false"
+    assert "--ignore-user-config" in argv and "--ignore-rules" in argv
+    assert argv[argv.index("--sandbox") + 1] == ("workspace-write" if profile == "trusted-development" else "read-only")
+    assert not any("dangerously" in item for item in argv)
+    parsed = tomllib.loads(overrides["mcp_servers.factoryfiles"])["mcp_servers"]["factoryfiles"]
+    assert parsed["enabled_tools"] == ["read_marker"]
+    assert parsed["env_vars"] == [] and parsed["required"] is True
+    features = {key.removeprefix("features."): tomllib.loads(value)["features"][key.removeprefix("features.")] for key, value in overrides.items() if key in {"features.code_mode_host", "features.daemon_auto_start", "features.hooks", "features.plugins"}}
+    official = json.loads((Path(__file__).parent / "fixtures" / "codex-0.157.0-scoped-schema.json").read_text())["schema"]
+    jsonschema.validate({"features": features}, official)
+
+
 @pytest.mark.parametrize("change", ["scope", "root", "path", "glob", "secret", "config", "argv", "tool", "timeout", "limit", "dot"])
 def test_mcp_manifest_fail_closed(repository, change):
     item = manifest()

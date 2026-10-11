@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import re
 import os
-import signal
 import time
 from collections.abc import Callable
 from fnmatch import fnmatchcase
@@ -48,15 +47,16 @@ class GitWorkspaceManager:
             self.control_guard()
         if self.execution_journal:
             from .journal import process_identity
+            self.execution_journal.ensure_process_capacity()
             self.execution_journal.update(supervisor=process_identity(os.getpid()), git_phase="spawn_intent")
-        from .journal import group_alive, process_identity
+        from .journal import group_alive, process_identity, stop_owned_session
         import queue
         import threading
         from typing import BinaryIO
         process = subprocess.Popen(argv, pass_fds=(self.worktree_lock_fd,) if os.name == "posix" and self.worktree_lock_fd is not None else (), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, env=restricted_env(), start_new_session=os.name == "posix")
         identity = process_identity(process.pid)
         if self.execution_journal:
-            self.execution_journal.update(process=identity, git_phase="running")
+            self.execution_journal.record_process(identity, git_phase="running")
         chunks: queue.Queue[tuple[str, bytes | None]] = queue.Queue(maxsize=64)
         finished = threading.Event()
         def reader(name: str, stream: BinaryIO) -> None:
@@ -114,19 +114,9 @@ class GitWorkspaceManager:
         finally:
             finished.set()
             # Stop descendants even if the immediate child has already exited.
-            if os.name == "posix" and group_alive(identity):
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                deadline = time.monotonic() + 1
-                while group_alive(identity) and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                if group_alive(identity):
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+            stopped = True
+            if os.name == "posix":
+                stopped = stop_owned_session(identity, grace_sec=1)
             elif process.poll() is None:
                 process.kill()
             try:
@@ -138,7 +128,9 @@ class GitWorkspaceManager:
             for pipe in (process.stdout, process.stderr):
                 pipe.close()
             if self.execution_journal:
-                self.execution_journal.update(process_stopped=not group_alive(identity), git_phase="stopped")
+                self.execution_journal.update(process_stopped=stopped and not group_alive(identity), git_phase="stopped")
+            if not stopped:
+                raise WorkerError("EXECUTION_UNCERTAIN", "Git session death could not be proved")
 
     def validate_repo(self, project: Json) -> Path:
         repo = within_root(Path(project["repo_path"]), self.root)

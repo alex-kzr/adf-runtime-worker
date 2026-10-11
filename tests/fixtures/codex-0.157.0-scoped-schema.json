@@ -20,6 +20,24 @@
           }
         ],
         "description": "User-level skill config entries keyed by SKILL.md path."
+      },
+      "features": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "code_mode_host": {
+            "$ref": "#/definitions/FeatureToml_for_CodeModeHostConfigToml"
+          },
+          "daemon_auto_start": {
+            "type": "boolean"
+          },
+          "hooks": {
+            "type": "boolean"
+          },
+          "plugins": {
+            "type": "boolean"
+          }
+        }
       }
     },
     "definitions": {
@@ -378,6 +396,29 @@
             "type": "string"
           }
         ]
+      },
+      "FeatureToml_for_CodeModeHostConfigToml": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "$ref": "#/definitions/CodeModeHostConfigToml"
+          }
+        ]
+      },
+      "CodeModeHostConfigToml": {
+        "additionalProperties": false,
+        "properties": {
+          "disable_in_process_fallback": {
+            "description": "Keep code mode fail-closed when the standalone host is unavailable.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
       }
     }
   }

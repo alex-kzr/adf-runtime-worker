@@ -59,3 +59,32 @@ def test_sink_exception_does_not_leave_child_alive(tmp_path):
     assert result.status == "failed"
     assert result.error_code == "INVALID_PROVIDER_EVENT"
     assert not group_alive(result.process_identity)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Dedicated Linux session containment")
+@pytest.mark.parametrize("cancel", [True, False])
+def test_stop_includes_stubborn_child_in_another_process_group(tmp_path, cancel):
+    from adf_runtime_worker.journal import process_identity, same_process
+    metadata = tmp_path / "child.json"
+    child = "import json,os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); open(" + repr(str(metadata)) + ", 'w').write(json.dumps({'pid':os.getpid(),'pgid':os.getpgrp(),'session_id':os.getsid(0)})); time.sleep(30)"
+    parent = "import subprocess,sys,time,pathlib; subprocess.Popen([sys.executable,'-c'," + repr(child) + "],process_group=0,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); p=pathlib.Path(" + repr(str(metadata)) + ");\nwhile not p.exists(): time.sleep(.01)\nprint('started',flush=True)\n" + ("time.sleep(30)" if cancel else "")
+    cancellation = Event()
+    runner = ProcessRunner(grace_sec=0.2)
+    identity = {}
+    def sink(_, text):
+        if text == "started":
+            import json
+            identity.update(process_identity(json.loads(metadata.read_text())["pid"]))
+            if cancel:
+                cancellation.set()
+    started = time.monotonic()
+    try:
+        result = runner.run([sys.executable, "-c", parent], request(tmp_path), sink, cancellation)
+        assert identity["pgid"] != result.process_identity["pgid"]
+        assert identity["session_id"] == result.process_identity["session_id"]
+        assert not same_process(identity), "Detached-PGID host survived the claimed stopped proof"
+        assert result.process_stopped and not group_alive(result.process_identity)
+        assert time.monotonic() - started < 3
+    finally:
+        if same_process(identity):
+            os.kill(identity["pid"], 9)

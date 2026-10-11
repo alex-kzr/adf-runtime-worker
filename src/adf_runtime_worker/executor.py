@@ -214,14 +214,14 @@ class Executor:
             return cast(Json, Redactor(self.secret_values).data(evidence))
 
     def _repair_snapshot(self, job: Json, workspace: Workspace, allowed_paths: list[str]) -> None:
-        from .journal import group_alive
+        from .journal import owned_sessions_stopped
         source_id = str(job["repair_source_execution_id"])
         if source_id == workspace.execution_id:
             raise WorkerError("IDEMPOTENCY_CONFLICT", "Repair requires a fresh allocation")
         with self.workspaces.worktree_lock(source_id):
             source = self.workspaces.load(source_id)
             saved = source.journal.read()
-            if saved.get("project_id") != job["project_id"] or saved.get("run_id") != job["run_id"] or source.root_base_sha != workspace.root_base_sha or group_alive(saved.get("process", {})):
+            if saved.get("project_id") != job["project_id"] or saved.get("run_id") != job["run_id"] or source.root_base_sha != workspace.root_base_sha or not owned_sessions_stopped(saved):
                 raise WorkerError("EXECUTION_UNCERTAIN", "Repair source has invalid ownership")
             if self.workspaces.git(source.path, "rev-parse", source.base_sha + "^{tree}") != self.workspaces.git(workspace.path, "rev-parse", workspace.base_sha + "^{tree}"):
                 raise WorkerError("VERSION_CONFLICT", "Repair dependency snapshot changed")
