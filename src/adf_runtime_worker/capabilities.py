@@ -14,14 +14,14 @@ _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 MCP_CONTRACT = "adf.scoped-files.v1"
 MCP_TOOLS = frozenset({"read_file", "read_marker"})
 MCP_DENIED_COMPONENTS = frozenset({".agents", ".codex", ".claude", ".git", ".ssh", ".aws", ".azure", ".kube", ".gnupg", ".config"})
-MCP_DENIED_BASENAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
+MCP_DENIED_BASENAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "auth.json", ".credentials.json", "worker-token", "redis-worker-password"})
 
 
 def validate_mcp_path(path: str) -> None:
     validate_relative(path)
     if len(path) > 1024 or Path(path).as_posix() != path or any(char in path for char in "*?[\\:"):
         raise WorkerError("INVALID_PATH", "MCP paths must be bounded canonical relative names")
-    if any(part.lower() in MCP_DENIED_COMPONENTS for part in Path(path).parts) or Path(path).name.lower() in MCP_DENIED_BASENAMES:
+    if any(part.lower() in MCP_DENIED_COMPONENTS for part in Path(path).parts) or Path(path).name.lower() in MCP_DENIED_BASENAMES or any(part.lower().startswith(".env") for part in Path(path).parts):
         raise WorkerError("PERMISSION_DENIED", "MCP cannot read credential or configuration paths")
 
 
@@ -89,3 +89,45 @@ def toml_value(value: Any) -> str:
     if isinstance(value, list):
         return "[" + ",".join(toml_value(item) for item in value) + "]"
     return json.dumps(value)
+
+
+def approved_capabilities(agent: Json, root: Path, workspace: Path, timeout: int, profile: str,
+                          secret_values: tuple[str, ...] = ()) -> tuple[tuple[SkillSnapshot, ...], Json, list[str]]:
+    """One durable registry narrowing rule for executor and shared owner."""
+    skills = tuple(skill_snapshot(item, root, secret_values) for item in agent.get("skills", []))
+    if len({skill.name for skill in skills}) != len(skills):
+        raise WorkerError("INVALID_REQUEST", "Approved skill names must be unique")
+    mcp: Json = {}
+    for item in agent.get("mcp_servers", []):
+        name, config = scoped_mcp(item, workspace, timeout)
+        if name in mcp:
+            raise WorkerError("INVALID_REQUEST", "MCP server names must be unique")
+        mcp[name] = config
+    provider = agent.get("provider", "mock")
+    mapped_tools: list[str] = []
+    for item in agent.get("tools", []):
+        manifest = item.get("manifest", item)
+        mappings = manifest.get("provider_mappings", {})
+        selected = mappings.get(provider)
+        if not isinstance(selected, list) or any(not isinstance(tool, str) for tool in selected):
+            raise WorkerError("CAPABILITY_UNSUPPORTED", "Tool registry needs verified provider mappings")
+        if profile != "trusted-development" and manifest.get("permission") != "read":
+            raise WorkerError("PERMISSION_DENIED", "Read-only role cannot inherit write/check tools")
+        if provider == "codex" and manifest.get("permission") != "read":
+            raise WorkerError("PERMISSION_DENIED", "Codex MCP registry requires read permission")
+        mapped_tools.extend(selected)
+    if provider in {"codex", "claude"}:
+        for name, config in mcp.items():
+            names = {"mcp__" + name + "__" + tool for tool in config["enabled_tools"]}
+            if agent.get("tools"):
+                selected = names.intersection(mapped_tools)
+                # A typed MCP registry narrows a server's approved catalog; never broadens it.
+                config["enabled_tools"] = [tool for tool in config["enabled_tools"] if "mcp__" + name + "__" + tool in selected]
+                if not config["enabled_tools"]:
+                    raise WorkerError("PERMISSION_DENIED", "Assigned MCP has no selected registry tools")
+            else:
+                mapped_tools.extend(sorted(names))
+        if provider == "codex" and any(tool not in {"mcp__" + name + "__" + tool for name, config in mcp.items() for tool in config["enabled_tools"]} for tool in mapped_tools):
+            raise WorkerError("CAPABILITY_UNSUPPORTED", "Codex narrow registry supports only assigned scoped MCP tools")
+    provider_tools = mapped_tools if agent.get("tools") or agent.get("mcp_servers") else agent.get("allowed_tools", [])
+    return skills, mcp, provider_tools

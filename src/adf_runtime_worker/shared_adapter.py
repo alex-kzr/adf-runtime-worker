@@ -65,8 +65,20 @@ class SharedCodexAdapter(CodexAdapter):
         return [sys.executable, "-I", "-m", "adf_runtime_worker.shared_job", "--config", str(path),
                 "--journal", str(request.journal_path), "--lock-fd", str(request.lock_fd)]
 
+    def _require_native_owner(self, request: Request) -> None:
+        health = self.probe(request.wall_deadline)
+        if health.get("policy") == "blocked":
+            raise WorkerError("PERMISSION_DENIED", "Shared operator policy generation is blocked")
+        if health.get("native_read_policy") != "restricted":
+            raise WorkerError("CAPABILITY_UNSUPPORTED", "Shared execution requires an operator-bound native read policy")
+        if health.get("auth") != "ready":
+            raise WorkerError("AUTH_REQUIRED", "Shared subscription authentication is required")
+        if health.get("health") != "ready":
+            raise WorkerError("EXECUTION_UNCERTAIN", "Shared owner is not ready")
+
     def execute(self, request: Request, event_sink: EventSink, cancellation: Event) -> AdapterResult:
         request = self._fixed_environment_request(request)
+        self._require_native_owner(request)
         if request.permission_profile == "trusted-development":
             health = self.probe(request.wall_deadline)
             if health.get("policy") == "blocked":

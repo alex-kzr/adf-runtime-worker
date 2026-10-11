@@ -154,7 +154,14 @@ def test_validation_precedes_native_probe_and_override_is_owner_derived(sealed_p
     probes = []
     monkeypatch.setattr(CodexAdapter, "probe", lambda *_: probes.append(True) or {"health": "ready"})
     selected = ProviderProfile("codex", policy.profile)
-    argv, _, _ = server_command("never-executed-codex", selected, policy)
+    from adf_runtime_worker.native_read_policy import NativeReadPolicy
+    tool = policy.root / "tools" / "public-bin"
+    tool.mkdir(mode=0o700)
+    manifest = policy.root / "tools" / "native-read.json"
+    manifest.write_text(json.dumps({"version": 1, "read_tool_roots": [str(tool)]}))
+    manifest.chmod(0o600)
+    native = NativeReadPolicy(policy, manifest)
+    argv, _, _ = server_command("never-executed-codex", selected, policy, native)
     assert probes == [True]
     assert any(arg.startswith("projects=") for arg in argv)
     assert not (policy.profile / "config.toml").exists()

@@ -22,6 +22,10 @@ def notify(method, params):
 
 
 def complete(thread_id, turn_id, cancelled):
+    native_result = None
+    if mode == "native-canary":
+        from native_read_canary import probe
+        native_result = probe(threads[thread_id])
     if mode == "revoked":
         notify("turn/completed", {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed",
                                  "error": {"codexErrorInfo": "unauthorized", "message": "AUTH_SECRET_MUST_NEVER_ESCAPE"}}})
@@ -30,7 +34,7 @@ def complete(thread_id, turn_id, cancelled):
         notify("item/completed", {"threadId": thread_id, "turnId": turn_id,
                                  "item": {"type": "reasoning", "text": "private reasoning"}})
         notify("item/completed", {"threadId": thread_id, "turnId": turn_id,
-                                 "item": {"type": "agentMessage", "text": threads[thread_id]["cwd"], "id": "answer"}})
+                                 "item": {"type": "agentMessage", "text": json.dumps(native_result) if native_result else threads[thread_id]["cwd"], "id": "answer"}})
     notify("thread/tokenUsage/updated", {"threadId": thread_id, "turnId": turn_id,
                                          "tokenUsage": {"last": {"inputTokens": 4, "outputTokens": 2}}})
     notify("turn/completed", {"threadId": thread_id, "turn": {"id": turn_id, "error": None, "status": "interrupted" if cancelled.is_set() else "completed"}})
@@ -51,11 +55,35 @@ for line in sys.stdin:
         if mode == "expired":
             send({"id": message["id"], "error": {"code": -1, "message": "AUTH_SECRET_MUST_NEVER_ESCAPE"}})
             continue
-        result = {"account": None if mode == "missing" else {"type": "chatgpt"}, "requiresOpenaiAuth": True}
+        if mode == "fake-refresh":
+            auth_path = Path(os.environ["CODEX_HOME"]) / "auth.json"
+            auth_path.write_text(json.dumps({"ADF_SYNTHETIC_OWNER_REFRESH": len(threads)}))
+            auth_path.chmod(0o600)
+        result = {"account": None if mode == "missing" else {"type": "apiKey" if mode == "api-key" else "chatgpt"}, "requiresOpenaiAuth": True}
     elif method == "thread/start":
         thread_id = "thread-" + str(len(threads) + 1)
         threads[thread_id] = params
+        native_metadata = None
+        if mode == "native-canary":
+            from native_read_canary import metadata
+            native_metadata, summary = metadata(params)
+            with capture.open("a") as stream:
+                stream.write(json.dumps({"method": "adf-test/native-metadata", "summary": summary}) + "\n")
         result = {"thread": {"id": thread_id}}
+        if params.get("config", {}).get("default_permissions"):
+            result.update(activePermissionProfile={"id": params["config"]["default_permissions"], "extends": None},
+                          runtimeWorkspaceRoots=[params["cwd"]], cwd=params["cwd"], approvalPolicy="never",
+                          sandbox={"type": "readOnly", "networkAccess": False}, modelProvider="openai")
+            if native_metadata is not None:
+                result = {**native_metadata, "thread": {"id": thread_id}}
+            if mode == "native-wrong-profile":
+                result["activePermissionProfile"]["id"] = ":read-only"
+            if mode == "native-wrong-roots":
+                result["runtimeWorkspaceRoots"].append(str(Path(params["cwd"]).parent))
+            if mode == "native-network":
+                result["sandbox"]["networkAccess"] = True
+            if mode == "native-wrong-provider":
+                result["modelProvider"] = "other"
     elif method == "turn/start":
         thread_id = params["threadId"]
         turn_id = "turn-" + thread_id
@@ -66,7 +94,7 @@ for line in sys.stdin:
         if mode == "crash":
             os._exit(13)
         def run(thread_id=thread_id, turn_id=turn_id, cancelled=cancelled):
-            cancelled.wait(3 if mode in {"slow", "slow-no-close"} else 0.6)
+            cancelled.wait(3 if mode in {"slow", "slow-no-close", "native-canary"} else 0.6)
             complete(thread_id, turn_id, cancelled)
         threading.Thread(target=run, daemon=True).start()
         continue

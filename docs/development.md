@@ -1,4 +1,6 @@
 # Host runtime development
+Current shared source uses [mandatory operator native-read permissions](native-read-policy.md) in addition to sealed trust fencing. The legacy full-host-read preflight FAILED; the new source canary validates its limited command/metadata boundary without models. Follow the matching startup flags and separate deployment scope.
+
 
 ## Opt-in shared-patch source backend
 

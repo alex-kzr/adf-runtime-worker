@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 from .journal import FileLock, Journal, process_identity, process_stopped, stop_owned_session
 from .models import WorkerError
 from .profiles import ProviderProfile
+from .native_read_policy import NativeReadPolicy
 from .profile_policy import SealedProfilePolicy
 from .security import restricted_env
 from .shared_rpc import FRAME_LIMIT, Rpc
@@ -119,10 +120,13 @@ def native_event(message: dict[str, Any]) -> dict[str, Any] | None:
 
 class SharedServer:
     def __init__(self, root: Path, argv: list[str], environment: dict[str, str], *, profile: Path | None = None,
-                 cleanup_timeout: float = 20, policy: SealedProfilePolicy | None = None) -> None:
+                 cleanup_timeout: float = 20, policy: SealedProfilePolicy | None = None, native_policy: NativeReadPolicy | None = None) -> None:
         self.root, self.argv, self.environment = root, argv, environment
         self.profile = profile
         self.policy = policy
+        self.native_policy = native_policy
+        if native_policy and native_policy.policy is not policy:
+            raise WorkerError("PERMISSION_DENIED", "Native policy requires the same sealed operator policy")
         self.dispatch_lock = policy.lock if policy else threading.RLock()
         self.policy_blocked = threading.Event()
         self.directory = root / "providers" / "codex"
@@ -146,6 +150,8 @@ class SharedServer:
         if self.policy:
             try:
                 self.policy.check()
+                if self.native_policy:
+                    self.native_policy.check()
             except WorkerError:
                 self.policy_blocked.set()
                 self.state.update(policy_blocked=True)
@@ -173,16 +179,24 @@ class SharedServer:
             if data.get("generation") == old.get("generation") and data.get("quiesced") is not True:
                 journal.update(status="uncertain", quiesced=True, proof="server_session_dead")
 
+    def _require_native_policy(self) -> None:
+        if self.native_policy is None or self.policy is None:
+            raise WorkerError("CAPABILITY_UNSUPPORTED", "Shared provider requires an operator-bound native read policy")
+
     def run(self) -> None:
+        self._require_native_policy()
         private_directory(self.directory)
         private_directory(self.directory / "jobs")
         with FileLock(self.root / "locks" / "provider-codex.lock"):
             self._recover()
             if self.policy:
                 self.policy.check()
+                if self.native_policy:
+                    self.native_policy.check()
             elif self.profile:
                 clean_config(self.profile)
-            self.state.update(generation=self.generation, owner=process_identity(os.getpid()), server=None, stopped=False, policy_blocked=False)
+            self.state.update(generation=self.generation, owner=process_identity(os.getpid()), server=None, stopped=False, policy_blocked=False,
+                              native_read_policy=self.native_policy.receipt(self.generation) if self.native_policy else None)
             monitor: threading.Thread | None = None
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
@@ -191,7 +205,8 @@ class SharedServer:
                 identity = process_identity(self.process.pid)
                 self.state.update(server=identity)
                 self.rpc = Rpc(self.process)
-                self.rpc.call("initialize", {"clientInfo": {"name": "adf-worker", "version": "0.1.0"}})
+                self.rpc.call("initialize", {"clientInfo": {"name": "adf-worker", "version": "0.1.0"},
+                                             **({"capabilities": {"experimentalApi": True}} if self.native_policy else {})})
                 self.rpc.send({"method": "initialized", "params": {}})
                 if self.policy:
                     with self.dispatch_lock:
@@ -265,6 +280,8 @@ class SharedServer:
             if frame.get("op") == "health":
                 auth = self.rpc.call("account/read", {"refreshToken": False})
                 authenticated = bool(auth.get("account")) and not self.auth_blocked.is_set()
+                if self.native_policy:
+                    authenticated = authenticated and auth["account"].get("type") == "chatgpt"
                 with self.dispatch_lock:
                     try:
                         self._check_policy()
@@ -276,10 +293,12 @@ class SharedServer:
                                         "permission_profiles": ["observe", "read_only"] if self.policy else ["observe", "read_only", "trusted-development"],
                                         "write_capability": {"supported": self.policy is None,
                                                              "error_code": "CAPABILITY_UNSUPPORTED" if self.policy else None},
+                                        "native_read_policy": "restricted" if self.native_policy else "legacy_unverified",
                                         "ready_for_real_execution": False})
                 return
             if frame.get("op") != "job":
                 raise WorkerError("INVALID_REQUEST", "Unknown shared operation")
+            self._require_native_policy()
             slot = self.slots.acquire(blocking=False)
             if not slot:
                 raise WorkerError("QUOTA_EXCEEDED", "Shared job quota exceeded")
@@ -319,7 +338,7 @@ class SharedServer:
                 auth = self.rpc.call("account/read", {"refreshToken": False})
             except WorkerError as exc:
                 raise WorkerError("AUTH_REQUIRED", "Persistent provider account is unavailable") from exc
-            if not auth.get("account"):
+            if not auth.get("account") or (self.native_policy and auth["account"].get("type") != "chatgpt"):
                 raise WorkerError("AUTH_REQUIRED", "Persistent provider profile is not authenticated")
             params = frame["start"]
             workspace = Path(params["cwd"])
@@ -354,16 +373,26 @@ class SharedServer:
                     # Pinned Linux sandbox creates a transient host .codex mount
                     # target. Strict no_layers cannot authorize that write mode.
                     raise WorkerError("CAPABILITY_UNSUPPORTED", "Sealed shared policy does not support workspace-write")
+                skill_paths: tuple[Path, ...] = ()
                 if self.policy:
                     self.policy.bind(frame["execution_id"], workspace, self.generation)
+                    if self.native_policy:
+                        skill_paths = self.native_policy.validate_capabilities(frame["execution_id"], workspace, config)
+                        self.native_policy.bind(frame["execution_id"], workspace, self.generation)
                     # The client was validated above; only the owner adds trust.
                     params = {**params, "config": {**config, "projects": self.policy.projects}}
+                if self.native_policy:
+                    params = {**params, "config": {**params["config"], **self.native_policy.overrides(workspace, skill_paths)}}
+                    params.pop("sandbox")
+                    params["allowProviderModelFallback"] = False
                 self._check_policy()
                 journal.update(status="thread_spawn_intent")
                 started = self.rpc.call("thread/start", params)
                 thread_id = str(started["thread"]["id"])
                 journal.update(thread_id=thread_id, status="starting")
                 events = self.rpc.subscribe(thread_id)
+                if self.native_policy:
+                    self.native_policy.verify_response(started, workspace)
                 self._check_policy()
                 turn = self.rpc.call("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": frame["prompt"]}], "outputSchema": frame.get("schema")})
                 turn_id = str(turn["turn"]["id"])
@@ -482,9 +511,13 @@ class SharedServer:
             self.connections.release()
 
 
-def server_command(executable: str, profile: ProviderProfile, policy: SealedProfilePolicy | None = None) -> tuple[list[str], dict[str, str], Path]:
+def server_command(executable: str, profile: ProviderProfile, policy: SealedProfilePolicy | None = None,
+                   native_policy: NativeReadPolicy | None = None) -> tuple[list[str], dict[str, str], Path]:
     from .adapters import CodexAdapter
     from .capabilities import toml_value
+    if native_policy is None or policy is None or native_policy.policy is not policy:
+        raise WorkerError("PERMISSION_DENIED", "Shared provider startup requires sealed trust and native read policies")
+    native_policy.check()
     if profile.directory is None:
         raise WorkerError("PERMISSION_DENIED", "Shared backend requires an explicit private operator profile")
     environment = {**restricted_env(), **profile.environment()}
@@ -498,7 +531,7 @@ def server_command(executable: str, profile: ProviderProfile, policy: SealedProf
     if health.get("health") != "ready":
         raise WorkerError("AUTH_REQUIRED" if health.get("pin_matches") is not False else "CLI_VERSION_MISMATCH", "Pinned shared provider must be authenticated by its operator")
     argv = [executable, "app-server", "--strict-config", "--listen", "stdio://"]
-    for name, value in baseline().items():
+    for name, value in {**baseline(), **native_policy.overrides(None)}.items():
         argv += ["-c", name + "=" + toml_value(value)]
     if policy:
         policy.check()

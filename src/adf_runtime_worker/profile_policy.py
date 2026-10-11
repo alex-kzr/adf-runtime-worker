@@ -274,6 +274,14 @@ def check_receipt(root: Path, saved: dict[str, Any]) -> None:
         policy = SealedProfilePolicy(root, Path(receipt["profile"]), Path(receipt["manifest"]), validate_repositories=False)
         if policy.digest != receipt["seal"]:
             raise denied()
+        native_receipt = saved.get("shared_native_read_policy")
+        if native_receipt is not None:
+            from .native_read_policy import NativeReadPolicy
+            native = NativeReadPolicy(policy, Path(native_receipt["manifest"]))
+            if native.receipt(receipt["generation"]) != native_receipt or state.get("native_read_policy") != native_receipt:
+                raise denied()
+        elif state.get("native_read_policy") is not None:
+            raise denied()
         no_layers(policy.profile, Path(saved["workspace"]["path"]))
         identity = policy._workspace_identity(Path(saved["workspace"]["path"]))
         if saved.get("shared_workspace_seal") != [list(identity[0]), identity[1]]:
@@ -304,6 +312,9 @@ def inherit_receipt(root: Path, target: Journal, *, source_id: str | None = None
             check_receipt(root, saved)
             target_saved = target.read()
             previous = target_saved.get("shared_profile_policy")
+            native_receipt = saved.get("shared_native_read_policy")
+            if target_saved.get("shared_native_read_policy") not in (None, native_receipt):
+                raise denied()
             if previous not in (None, receipt):
                 raise denied()
             if previous is not None:
@@ -313,6 +324,7 @@ def inherit_receipt(root: Path, target: Journal, *, source_id: str | None = None
                 if policy.digest != receipt["seal"]:
                     raise denied()
                 identity = policy.allocation_identity(target_saved["execution_id"], target_saved)
-                target.update(shared_profile_policy=receipt, shared_workspace_seal=[list(identity[0]), identity[1]])
+                target.update(shared_profile_policy=receipt, shared_workspace_seal=[list(identity[0]), identity[1]],
+                              **({"shared_native_read_policy": native_receipt} if native_receipt is not None else {}))
     except (OSError, ValueError, TypeError, AttributeError, KeyError, RecursionError, WorkerError) as exc:
         raise denied() from exc

@@ -1,4 +1,6 @@
 # Sealed shared Codex project policy
+Current shared source requires both this trust manifest and the [native-read manifest](native-read-policy.md). Legacy read-only grants failed secret-read preflight; no unsealed shared production path remains. Dated trust-only results below do not constitute native read acceptance.
+
 
 This is an opt-in source implementation of [umbrella ADR 007](../../../docs/adr/007-sealed-shared-profile-policy.md). Native queued acceptance and MVP readiness remain pending. No ordinary worker startup writes or repairs the provider configuration.
 
@@ -6,13 +8,13 @@ This is an opt-in source implementation of [umbrella ADR 007](../../../docs/adr/
 
 The pinned Codex 0.157.0 Linux `workspace-write` sandbox creates an empty host `.codex` directory as a temporary protected mount target. This conflicts with the policy's strict absence checks even when no configuration is present. [Pinned source, no-model reproduction and retained runtime provenance](../../../docs/shared-sandbox-recovery-repair.md) establish this mechanism. The guard, its polling monitor and receipt fencing remain unchanged.
 
-With this policy, only `observe` / `read_only` are supported. The adapter rejects `trusted-development` before session/skill materialization. The owner independently rejects a direct `workspace-write` IPC frame with `CAPABILITY_UNSUPPORTED` before binding or native thread/turn creation, recording a quiesced `no_thread` tombstone. Unsupported writes do not block the generation or read-only siblings. Default unsealed/subprocess behavior is unchanged and does not gain additional verified isolation from this repair.
+With this policy, only `observe` / `read_only` are supported. The adapter rejects `trusted-development` before session/skill materialization. The owner independently rejects a direct `workspace-write` IPC frame with `CAPABILITY_UNSUPPORTED` before binding or native thread/turn creation, recording a quiesced `no_thread` tombstone. Unsupported writes do not block the generation or read-only siblings. Subprocess behavior remains unchanged; current shared source has no unsealed production path and also requires the native-read manifest.
 
 Health separates authentication (`auth`), policy state (`policy`), supported `permission_profiles` and `write_capability`. A ready transport/auth check is compatible with unsupported writes; `ready_for_real_execution` remains false. This is a truthful capability correction, not completion of autonomous coding or the three-job native acceptance gate. Allowing an empty `.codex`, switching sandbox implementations, disabling monitoring or upgrading the CLI requires separate policy/architecture review and authorization.
 
 ## Operator input
 
-Only `provider-server` accepts `--shared-profile-policy`; jobs, API requests and consumer configuration cannot select or extend it. Omission preserves the default refusal of every `config.toml` and policy layer. Put the manifest below the runtime's `tools` directory, outside repositories/worktrees:
+Only `provider-server` accepts `--shared-profile-policy`; jobs, API requests and consumer configuration cannot select or extend it. Omission of either mandatory operator manifest refuses startup before CLI probing. Put the manifest below the runtime's `tools` directory, outside repositories/worktrees:
 
 ```json
 {
@@ -23,7 +25,7 @@ Only `provider-server` accepts `--shared-profile-policy`; jobs, API requests and
 }
 ```
 
-The manifest must be a canonical same-UID regular file, mode 0600, one link, at most 64 KiB. Its closed schema permits 1–32 distinct exact main Git roots under `ROOT/projects`; directory-wide/wildcard trust, linked-worktree roots, aliases, extra keys and duplicates are rejected. Main directories and `.git` directories must be owned, canonical and not writable by group/others. Root inode/ownership/mode identities are sealed. Existing Git configuration/hook checks still apply.
+The manifest must be a canonical same-UID regular file, mode 0600, one link, at most 64 KiB. Its closed schema permits 1вЂ“32 distinct exact main Git roots under `ROOT/projects`; directory-wide/wildcard trust, linked-worktree roots, aliases, extra keys and duplicates are rejected. Main directories and `.git` directories must be owned, canonical and not writable by group/others. Root inode/ownership/mode identities are sealed. Existing Git configuration/hook checks still apply.
 
 The profile remains a separate canonical owned 0700 directory. An absent `config.toml` is accepted and its absence is sealed. An existing file must satisfy the same private-file checks and parse to **exactly** the declared project table:
 
@@ -56,7 +58,8 @@ After approval of the exact worker release, drained runtime, existing profile cl
 adf-worker provider-server --root /home/adf-worker/ai-factory \
   --node /absolute/pinned/node --codex /absolute/pinned/codex \
   --codex-home /home/adf-worker/ai-factory/provider-profiles/codex \
-  --shared-profile-policy /home/adf-worker/ai-factory/tools/shared-profile-policy.json
+  --shared-profile-policy /home/adf-worker/ai-factory/tools/shared-profile-policy.json \
+  --shared-native-read-policy /home/adf-worker/ai-factory/tools/shared-native-read-policy.json
 ```
 
 The consumer keeps its existing settings and `--codex-backend shared`. Keep a verified immutable previous worker source and dependency inventory before replacing its venv. Invalid existing config stops deployment and is preserved; this scope does not authorize deleting, renaming, merging or overwriting it. Roll back only after writers drain or recorded ownership proves them stopped. A previously rejecting profile stays rejecting under the old release; a stopped, verified old worker is a valid safe rollback state.

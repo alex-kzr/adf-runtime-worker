@@ -1,4 +1,6 @@
 # Persistent profiles and shared Codex execution
+Current source requires both `--shared-profile-policy` and `--shared-native-read-policy`; an unsealed/legacy owner is refused. [Native read manifest and limits](native-read-policy.md) supersede older optional-policy/read-only startup examples below. Runtime deployment and subscription acceptance remain pending.
+
 
 Implemented locally on October 11, 2026; native model acceptance is pending. This stays within runtime-worker. See [ADR 006](../../../docs/adr/006-provider-profile-ownership.md) and [identity findings](../../../docs/provider-identity.md).
 
@@ -13,7 +15,9 @@ The compatible Codex default is `--codex-backend subprocess`. After the account/
 ```bash
 # Paths refer to existing provisioned profiles/tools; never secret values.
 adf-worker provider-server --root "$ADF_WORKER_ROOT" \
-  --node "$ADF_NODE_PATH" --codex "$ADF_CODEX_PATH" --codex-home "$ADF_CODEX_HOME"
+  --node "$ADF_NODE_PATH" --codex "$ADF_CODEX_PATH" --codex-home "$ADF_CODEX_HOME" \
+  --shared-profile-policy "$ADF_WORKER_ROOT/tools/shared-profile-policy.json" \
+  --shared-native-read-policy "$ADF_WORKER_ROOT/tools/shared-native-read-policy.json"
 
 # Separate consumer process/service, with its existing private token files.
 adf-worker serve --root "$ADF_WORKER_ROOT" --codex-backend shared \
@@ -22,9 +26,9 @@ adf-worker serve --root "$ADF_WORKER_ROOT" --codex-backend shared \
   --token-file "$ADF_WORKER_TOKEN_FILE" --redis-password-file "$ADF_REDIS_PASSWORD_FILE"
 ```
 
-These instructions were not executed against the deployed services. No new login is requested. Rollback drains shared jobs, stops the provider owner and switches the consumer to `subprocess`. Do not run Codex subprocess jobs or other rotating-auth clients against the shared profile concurrently. Legacy tickets default to the original backend; new tickets snapshot trusted backend/profile paths. API/Redis/workflow contracts are unchanged.
+These instructions were not executed against the deployed services. No new login is requested. Rollback drains shared jobs and stops the provider owner/consumer, then restores a verified stopped worker; legacy full-host reads are not accepted isolation. Do not run Codex subprocess jobs or other rotating-auth clients against the shared profile concurrently. Legacy tickets default to the original backend; new tickets snapshot trusted backend/profile paths. API/Redis/workflow contracts are unchanged.
 
-Shared startup verifies Codex **0.157.0** / Node **24.21.0**. By default it requires an explicit clean profile without `config.toml`, rules, skills, AGENTS or environment layers. The operator-only [sealed profile policy](shared-profile-policy.md) adds a reviewed exact-project trust mode with owner CLI overrides, allocator binding and drift fencing; it writes no provider config and jobs cannot extend it. Worktree and main-root ancestry containing another `.codex` layer is refused in that mode. Pinned app-server has no exec `--ignore-user-config` / `--ignore-rules`; refusing unsupported layers avoids claiming equivalent switches. Administrator requirements may further restrict execution. The worker never changes an existing profile to satisfy these rules.
+Shared startup verifies Codex **0.157.0** / Node **24.21.0**. It requires both private operator manifests and an explicit profile without rules, skills, AGENTS or environment layers. The operator-only [sealed profile policy](shared-profile-policy.md) permits only absent config or reviewed exact-project trust config with owner CLI overrides, allocator binding and drift fencing; it writes no provider config and jobs cannot extend it. Worktree and main-root ancestry containing another `.codex` layer is refused in that mode. Pinned app-server has no exec `--ignore-user-config` / `--ignore-rules`; refusing unsupported layers avoids claiming equivalent switches. Administrator requirements may further restrict execution. The worker never changes an existing profile to satisfy these rules.
 
 ## Boundaries and protocol
 

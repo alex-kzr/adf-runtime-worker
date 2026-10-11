@@ -27,9 +27,22 @@ FAKE = Path(__file__).parent / "fixtures" / "shared_app_server.py"
 
 
 @pytest.fixture
-def server(tmp_path):
+def server(tmp_path, monkeypatch):
     running = []
-    def start(mode="ready", root=None, environment=None, profile=None, policy=None):
+    inert_roots = set()
+    owner_check = SharedServer._require_native_policy
+    adapter_check = SharedCodexAdapter._require_native_owner
+    # Explicitly inert protocol doubles only; production entry points have no
+    # opt-out for legacy native permissions. Native-policy tests keep the gate.
+    def check_owner(runtime):
+        if runtime.root not in inert_roots:
+            owner_check(runtime)
+    def check_adapter(adapter, request):
+        if adapter.root not in inert_roots:
+            adapter_check(adapter, request)
+    monkeypatch.setattr(SharedServer, "_require_native_policy", check_owner)
+    monkeypatch.setattr(SharedCodexAdapter, "_require_native_owner", check_adapter)
+    def start(mode="ready", root=None, environment=None, profile=None, policy=None, native_policy=None):
         root = root or tmp_path / ("root-" + str(len(running)))
         # The durable stopped receipt precedes socket unlink. Join the owned
         # offline thread before replacement so a stale socket is not readiness.
@@ -42,7 +55,9 @@ def server(tmp_path):
         root.chmod(0o700)
         capture = tmp_path / ("wire-" + str(len(running)) + ".jsonl")
         runtime = SharedServer(root, [sys.executable, str(FAKE), str(capture), mode],
-                               restricted_env() if environment is None else environment, profile=profile, cleanup_timeout=0.7, policy=policy)
+                               restricted_env() if environment is None else environment, profile=profile, cleanup_timeout=0.7, policy=policy, native_policy=native_policy)
+        if native_policy is None:
+            inert_roots.add(root)
         errors = []
         def run():
             try:
@@ -78,6 +93,7 @@ def request(root, tmp_path, number):
 def policy_request(policy, job, number=0):
     allocation = {**job, "execution_id": str(uuid4()), "run_id": str(uuid4()), "task_id": str(uuid4()), "project_id": str(uuid4())}
     workspace = GitWorkspaceManager(policy.root, require_ext4=False).allocate(allocation)
+    workspace.journal.update(request=allocation)
     return Request(allocation["execution_id"], allocation["run_id"], 1, workspace.path, "synthetic policy job", 8,
                    # Sealed policy supports read-only only: fake providers must
                    # not claim compatibility with native synthetic mount writes.
@@ -586,7 +602,8 @@ def test_actual_orchestrator_baseline_uses_fixed_operator_environment(server, tm
     for name in ("OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ADF_WORKER_TOKEN", "ADF_REDIS_PASSWORD"):
         monkeypatch.setenv(name, "synthetic-private-value")
     monkeypatch.setattr(CodexAdapter, "probe", lambda *_: {"health": "ready"})
-    _, environment, selected_profile = server_command("synthetic-codex", ProviderProfile("codex", profile))
+    environment = {**restricted_env(), **ProviderProfile("codex", profile).environment()}
+    selected_profile = profile
     runtime, capture = server(environment=environment, profile=selected_profile)
     adapter = SharedCodexAdapter(runtime.root)
     job = replace(request(runtime.root, tmp_path, 0), env_allowlist=names)
@@ -647,3 +664,434 @@ def test_revoked_auth_stops_further_dispatch_without_login_or_raw_error(server, 
     assert all("login" not in str(item["method"]) for item in wire)
     assert "AUTH_SECRET" not in json.dumps(events)
     assert "AUTH_SECRET" not in json.dumps(Journal(job_path(runtime.root, job.execution_id)).read())
+
+# Source regressions for the new owner-bound native policy. The generic fixture
+# above retains legacy transport tests; provider-server cannot start in that mode.
+@pytest.fixture
+def native_policy(sealed_policy):
+    from adf_runtime_worker.native_read_policy import NativeReadPolicy
+    tool = sealed_policy.root / "tools" / "public-bin"
+    tool.mkdir(mode=0o700)
+    manifest = sealed_policy.root / "tools" / "native-read-policy.json"
+    manifest.write_text(json.dumps({"version": 1, "read_tool_roots": [str(tool)]}))
+    manifest.chmod(0o600)
+    return NativeReadPolicy(sealed_policy, manifest)
+
+
+def native_server(server, native_policy, mode="ready"):
+    policy = native_policy.policy
+    return server(mode=mode, root=policy.root, profile=policy.profile, policy=policy, native_policy=native_policy,
+                  environment={**restricted_env(), "CODEX_HOME": str(policy.profile)})
+
+
+def test_native_startup_requires_both_operator_policies_before_probe(monkeypatch, native_policy):
+    from adf_runtime_worker.adapters import CodexAdapter
+    from adf_runtime_worker.profiles import ProviderProfile
+    monkeypatch.setenv("HOME", str(native_policy.policy.root.parent))
+    profile = ProviderProfile("codex", native_policy.policy.profile)
+    monkeypatch.setattr(CodexAdapter, "probe", lambda *_: pytest.fail("Invalid policy reached provider probe"))
+    for policy, native in ((None, None), (native_policy.policy, None), (None, native_policy)):
+        with pytest.raises(WorkerError, match="requires sealed trust"):
+            server_command("synthetic-codex", profile, policy, native)
+
+
+def test_native_command_contains_owner_only_default_deny_without_workspace(monkeypatch, native_policy):
+    from adf_runtime_worker.adapters import CodexAdapter
+    from adf_runtime_worker.profiles import ProviderProfile
+    monkeypatch.setattr(CodexAdapter, "probe", lambda *_: {"health": "ready"})
+    monkeypatch.setenv("HOME", str(native_policy.policy.root.parent))
+    argv, _, _ = server_command("synthetic-codex", ProviderProfile("codex", native_policy.policy.profile), native_policy.policy, native_policy)
+    assert not any("sandbox_mode" in arg for arg in argv)
+    assert 'default_permissions="adf_shared_read"' in argv
+    assert 'features.request_permissions_tool=false' in argv
+    fs = native_policy.overrides(None)["permissions"]["adf_shared_read"]["filesystem"]
+    assert fs[":root"] == "deny" and ":workspace_roots" not in fs and ":read-only" not in fs
+    assert set(fs.values()) <= {"read", "deny"}
+    assert not any(str(native_policy.policy.root / "worktrees") in key and value == "read" for key, value in fs.items())
+
+
+@pytest.mark.parametrize("fault", ["extra", "duplicate", "broad", "alias", "wrong-mode", "profile-overlap", "trust-manifest-overlap"])
+def test_native_operator_manifest_rejects_expansion(native_policy, fault):
+    from adf_runtime_worker.native_read_policy import NativeReadPolicy
+    policy = native_policy.policy
+    data = {"version": 1, "read_tool_roots": [str(native_policy.tool_roots[0])]}
+    if fault == "extra":
+        data["network"] = True
+    elif fault == "duplicate":
+        data["read_tool_roots"] *= 2
+    elif fault == "broad":
+        data["read_tool_roots"] = [str(policy.root / "tools")]
+    elif fault == "alias":
+        alias = policy.root / "tools" / "alias"
+        alias.symlink_to(native_policy.tool_roots[0])
+        data["read_tool_roots"] = [str(alias)]
+    elif fault == "profile-overlap":
+        profile = policy.root / "tools" / "profile"
+        profile.mkdir(mode=0o700)
+        policy = SealedProfilePolicy(policy.root, profile, policy.manifest)
+        data["read_tool_roots"] = [str(profile)]
+    elif fault == "trust-manifest-overlap":
+        directory = policy.root / "tools" / "trust"
+        directory.mkdir(mode=0o700)
+        new_manifest = directory / "trust.json"
+        new_manifest.write_bytes(policy.manifest.read_bytes())
+        new_manifest.chmod(0o600)
+        policy = SealedProfilePolicy(policy.root, policy.profile, new_manifest)
+        data["read_tool_roots"] = [str(directory)]
+    native_policy.manifest.write_text(json.dumps(data))
+    native_policy.manifest.chmod(0o644 if fault == "wrong-mode" else 0o600)
+    with pytest.raises(WorkerError):
+        NativeReadPolicy(policy, native_policy.manifest)
+
+
+def test_native_three_jobs_cancel_only_one_and_auth_refresh_is_owner_only(server, native_policy, job):
+    policy = native_policy.policy
+    runtime, capture = native_server(server, native_policy, "fake-refresh")
+    # This is a synthetic auth canary. Native policy never reads its contents.
+    auth = policy.profile / "auth.json"
+    auth.write_text('{"ADF_SYNTHETIC_AUTH": "initial"}')
+    auth.chmod(0o600)
+    jobs = [policy_request(policy, job, number) for number in range(3)]
+    cancels = [Event() for _ in jobs]
+    results = {}
+    runners = [threading.Thread(target=lambda n=n: results.update({n: policy_execute(runtime, jobs[n], cancels[n])})) for n in range(3)]
+    for runner in runners:
+        runner.start()
+    until = time.monotonic() + 5
+    while len(wire_methods(capture, "turn/start")) < 3 and time.monotonic() < until:
+        time.sleep(0.01)
+    assert len(wire_methods(capture, "turn/start")) == 3
+    cancels[0].set()
+    for runner in runners:
+        runner.join(timeout=12)
+        assert not runner.is_alive()
+    assert results[0].status == "cancelled"
+    assert results[1].status == results[2].status == "succeeded"
+    assert len(wire_methods(capture, "turn/interrupt")) == 1
+    assert json.loads(auth.read_text()).get("ADF_SYNTHETIC_OWNER_REFRESH") is not None
+    for item in wire_methods(capture, "thread/start"):
+        params = item["params"]
+        workspace = Path(params["cwd"])
+        assert "sandbox" not in params and params["allowProviderModelFallback"] is False
+        fs = params["config"]["permissions"]["adf_shared_read"]["filesystem"]
+        assert fs[str(workspace)] == "read"
+        assert not any(fs.get(str(other.workspace_path)) == "read" for other in jobs if other.workspace_path != workspace)
+        assert params["config"]["permissions"]["adf_shared_read"]["network"] == {"enabled": False}
+    for request in jobs:
+        check_receipt(policy.root, Journal(request.journal_path).read())
+    assert not (policy.profile / "config.toml").exists()
+
+
+@pytest.mark.parametrize("mode", ["native-wrong-profile", "native-wrong-roots", "native-network", "native-wrong-provider"])
+def test_native_effective_policy_mismatch_closes_without_turn(server, native_policy, job, mode):
+    runtime, capture = native_server(server, native_policy, mode)
+    request = policy_request(native_policy.policy, job)
+    result = policy_execute(runtime, request)
+    assert result.status == "failed" and result.error_code == "PERMISSION_DENIED"
+    assert not wire_methods(capture, "turn/start")
+    assert len(wire_methods(capture, "thread/unsubscribe")) == 1
+    assert Journal(job_path(runtime.root, request.execution_id)).read()["quiesced"] is True
+
+
+def test_native_api_key_account_is_blocked_without_turn(server, native_policy, job):
+    runtime, capture = native_server(server, native_policy, "api-key")
+    assert SharedCodexAdapter(runtime.root).probe()["auth"] == "required"
+    with pytest.raises(WorkerError) as denied:
+        policy_execute(runtime, policy_request(native_policy.policy, job))
+    assert denied.value.code == "AUTH_REQUIRED"
+    assert not wire_methods(capture, "thread/start")
+
+
+@pytest.mark.parametrize("fault", ["default_permissions", "permissions", "runtimeWorkspaceRoots", "projects"])
+def test_native_client_cannot_supply_permission_authority(server, native_policy, job, tmp_path, fault, capsys):
+    runtime, capture = native_server(server, native_policy)
+    request = policy_request(native_policy.policy, job)
+    generated = runtime.root / "journals" / "direct-native"
+    generated.mkdir(mode=0o700)
+    with FileLock(runtime.root / "locks" / ("execution-" + request.execution_id + ".lock")) as lock:
+        SharedCodexAdapter(runtime.root).argv(replace(request, lock_fd=lock.fd), generated)
+        config = json.loads((generated / "shared-job.json").read_text())
+        config["start"]["config"][fault] = {"/": "read"}
+        assert bridge(config, "synthetic", lock.fd, request.journal_path, Event()) == 1
+    capsys.readouterr()
+    assert not wire_methods(capture, "thread/start")
+    assert Journal(job_path(runtime.root, request.execution_id)).read()["code"] == "PERMISSION_DENIED"
+
+
+def test_native_manifest_drift_cancels_siblings_and_fences_descendants(server, native_policy, job):
+    from adf_runtime_worker.profile_policy import inherit_receipt
+    runtime, capture = native_server(server, native_policy, "slow")
+    request = policy_request(native_policy.policy, job)
+    results = {}
+    runner = threading.Thread(target=lambda: results.update(result=policy_execute(runtime, request)))
+    runner.start()
+    until = time.monotonic() + 5
+    while not wire_methods(capture, "turn/start") and time.monotonic() < until:
+        time.sleep(0.01)
+    native_policy.manifest.write_bytes(native_policy.manifest.read_bytes() + b"\n")
+    runner.join(timeout=10)
+    assert not runner.is_alive()
+    assert results["result"].status == "failed" and runtime.policy_blocked.is_set()
+    assert len(wire_methods(capture, "turn/interrupt")) == 1
+    with pytest.raises(WorkerError):
+        check_receipt(runtime.root, Journal(request.journal_path).read())
+    target = policy_request(native_policy.policy, job, 1)
+    with pytest.raises(WorkerError):
+        inherit_receipt(runtime.root, Journal(target.journal_path), source_id=request.execution_id)
+
+
+def test_native_crash_proof_restarts_without_replaying_execution(server, native_policy, job):
+    runtime, capture = native_server(server, native_policy, "crash")
+    request = policy_request(native_policy.policy, job)
+    result = policy_execute(runtime, request)
+    assert result.status == "uncertain"
+    until = time.monotonic() + 6
+    while runtime.state.read().get("stopped") is not True and time.monotonic() < until:
+        time.sleep(0.02)
+    assert runtime.state.read()["stopped"] is True
+    assert shared_stopped(Journal(request.journal_path).read()["shared_session"])
+    replacement, _ = native_server(server, native_policy)
+    assert policy_execute(replacement, request).error_code == "EXECUTION_UNCERTAIN"
+    assert policy_execute(replacement, policy_request(native_policy.policy, job, 1)).status == "succeeded"
+    assert len(wire_methods(capture, "turn/start")) == 1
+
+@pytest.mark.parametrize("marker", [None, "legacy_unverified", "default"])
+def test_new_consumer_refuses_legacy_owner_before_materialization(tmp_path, monkeypatch, marker):
+    adapter = SharedCodexAdapter(tmp_path)
+    monkeypatch.setattr(adapter, "probe", lambda *_: {"health": "ready", "auth": "ready", "native_read_policy": marker})
+    monkeypatch.setattr(adapter.runner, "run", lambda *_: pytest.fail("Legacy owner reached provider bridge"))
+    request = Request(str(uuid4()), str(uuid4()), 1, permission_profile="observe")
+    with pytest.raises(WorkerError) as error:
+        adapter.execute(request, lambda *_: None, Event())
+    assert error.value.code == "CAPABILITY_UNSUPPORTED"
+
+
+def test_direct_shared_owner_requires_native_policy_before_spawn(tmp_path):
+    runtime = SharedServer(tmp_path, ["never-launch"], {})
+    with pytest.raises(WorkerError) as error:
+        runtime.run()
+    assert error.value.code == "CAPABILITY_UNSUPPORTED" and not runtime.directory.exists()
+
+
+def capability_job(native_policy, job, number=0, maximum=8):
+    from adf_runtime_worker.capabilities import approved_capabilities
+    root = native_policy.policy.root
+    skill = root / "skills" / "scoped" / "SKILL.md"
+    skill.parent.mkdir(parents=True, mode=0o700)
+    content = "---\nname: scoped\ndescription: synthetic approved skill\n---\nRead the assigned marker.\n"
+    skill.write_text(content)
+    skill.chmod(0o600)
+    mcp = {"name": "files", "trusted": True, "transport": "stdio",
+           "argv": ["python3", "-m", "adf_runtime_worker.scoped_mcp"], "allowed_tools": ["read_file", "read_marker"],
+           "scope": {"contract": "adf.scoped-files.v1", "root": "$WORKTREE", "read_paths": ["README.md"], "max_bytes": 4096}, "timeout_sec": 8}
+    body = {**job, "timeout_sec": maximum, "agent": {"provider": "codex", "permission_profile": "observe",
+            "skills": [{"path": str(skill), "sha256": hashlib.sha256(content.encode()).hexdigest()}],
+            "mcp_servers": [mcp], "tools": [{"permission": "read", "provider_mappings": {"codex": ["mcp__files__read_marker"]}}]}}
+    request = policy_request(native_policy.policy, body, number)
+    skills, configs, tools = approved_capabilities(body["agent"], root, request.workspace_path, maximum, "observe")
+    return replace(request, approved_skills=skills, mcp_config=configs, allowed_tools=tuple(tools))
+
+
+def test_native_scoped_skills_and_mcp_use_same_durable_narrowing(server, native_policy, job):
+    runtime, capture = native_server(server, native_policy)
+    request = capability_job(native_policy, job)
+    assert policy_execute(runtime, request).status == "succeeded"
+    params = wire_methods(capture, "thread/start")[0]["params"]
+    launch = params["config"]["mcp_servers"]["files"]
+    assert launch["enabled_tools"] == ["read_marker"] and launch["env_vars"] == []
+    fs = params["config"]["permissions"]["adf_shared_read"]["filesystem"]
+    assert fs[str(request.workspace_path / ".agents" / "skills" / "scoped" / "SKILL.md")] == "read"
+    assert fs[str(request.workspace_path / ".codex")] == "deny"
+    assert not (request.workspace_path / ".agents").exists()
+
+
+@pytest.mark.parametrize("fault", ["env", "env_vars", "extra-launch", "outside-scope", "extra-config", "extra-tool", "outside-skill", "host-discovery"])
+def test_native_direct_capability_forgery_never_starts_thread(server, native_policy, job, fault, capsys):
+    from adf_runtime_worker.native_skills import native_skills
+    runtime, capture = native_server(server, native_policy)
+    request = capability_job(native_policy, job)
+    generated = runtime.root / "journals" / "direct-native-caps"
+    generated.mkdir(mode=0o700)
+    with FileLock(runtime.root / "locks" / ("execution-" + request.execution_id + ".lock")) as lock:
+        with native_skills(request) as (skill_config, prompt):
+            effective = replace(request, lock_fd=lock.fd, native_skill_config=skill_config)
+            SharedCodexAdapter(runtime.root).argv(effective, generated)
+            config = json.loads((generated / "shared-job.json").read_text())
+            dynamic = config["start"]["config"]
+            launch = dynamic["mcp_servers"]["files"]
+            stored_path = Path(launch["args"][-1])
+            stored = json.loads(stored_path.read_text())
+            if fault == "env":
+                launch["env"] = {"LD_PRELOAD": "synthetic"}
+            elif fault == "env_vars":
+                launch["env_vars"] = ["CODEX_HOME"]
+            elif fault == "extra-launch":
+                launch["url"] = "http://synthetic.invalid"
+            elif fault == "outside-scope":
+                stored["scope"]["root"] = str(runtime.root)
+                stored_path.write_text(json.dumps(stored))
+            elif fault == "extra-config":
+                stored["env"] = {"HOME": "synthetic"}
+                stored_path.write_text(json.dumps(stored))
+            elif fault == "extra-tool":
+                launch["enabled_tools"].append("read_file")
+                stored["enabled_tools"].append("read_file")
+                stored_path.write_text(json.dumps(stored))
+            elif fault == "outside-skill":
+                dynamic["skills"]["config"].append({"path": str(runtime.root / "outside/SKILL.md"), "enabled": True})
+            elif fault == "host-discovery":
+                dynamic["features.skip_host_skill_discovery"] = True
+            assert bridge(config, prompt, lock.fd, request.journal_path, Event()) == 1
+    capsys.readouterr()
+    assert not wire_methods(capture, "thread/start")
+    assert Journal(job_path(runtime.root, request.execution_id)).read()["code"] == "PERMISSION_DENIED"
+
+@pytest.mark.skipif(not os.environ.get("ADF_TEST_CODEX_PATH"), reason="Pinned public native fixture must be explicitly supplied")
+def test_real_native_permissions_through_shared_ipc_without_model(server, native_policy, job):
+    """Actual metadata + command sandbox; fake turns, never model acceptance."""
+    import stat
+    from adf_runtime_worker.native_read_policy import NativeReadPolicy
+    policy = native_policy.policy
+    source = Path(os.environ["ADF_TEST_CODEX_PATH"])
+    vendor = policy.root / "tools" / "native-vendor"
+    fingerprints = {"bin/codex": "1a822376d4634ac32dddc030e5117c63359f7f8cd4b1b64382c68190287d0258",
+                    "codex-resources/bwrap": "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c"}
+    for relative, expected in fingerprints.items():
+        original = source.parent.parent / relative
+        before = original.stat(follow_symlinks=False)
+        assert stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+        target = vendor / relative
+        target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOATIME)
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "rb") as incoming, target.open("xb") as output:
+            while chunk := incoming.read(1024 * 1024):
+                digest.update(chunk)
+                output.write(chunk)
+        target.chmod(0o700)
+        assert digest.hexdigest() == expected
+        after = original.stat(follow_symlinks=False)
+        assert (before.st_atime_ns, before.st_mtime_ns, before.st_ctime_ns) == (after.st_atime_ns, after.st_mtime_ns, after.st_ctime_ns)
+    native_policy.manifest.write_text(json.dumps({"version": 1, "read_tool_roots": [str(vendor)]}))
+    selected = NativeReadPolicy(policy, native_policy.manifest)
+    jobs = [replace(policy_request(policy, {**job, "timeout_sec": 30}, number), timeout_sec=30) for number in (0, 2)]
+    jobs.insert(1, capability_job(selected, job, 1, 30))
+    canaries = []
+    for label, path in (("outside", policy.root / "outside/canary"),
+                        ("codex_auth", policy.profile / "auth.json"),
+                        ("claude_auth", policy.root / "provider-profiles/claude/.credentials.json"),
+                        ("worker_config", policy.root / "config/worker-token"),
+                        ("redis_config", policy.root / "config/redis-worker-password")):
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path.write_text("ADF synthetic canary " + label)
+        path.chmod(0o600)
+        canaries.append((label, str(path)))
+    for request in jobs:
+        workspace = request.workspace_path
+        (workspace / "inside-canary").write_text("ADF synthetic project canary")
+        for name in ("src/.codex/auth.json", "src/.ssh/id_ed25519", "src/.envrc", ".env", "src/auth.json"):
+            path = workspace / name
+            path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            path.write_text("ADF synthetic nested private canary")
+            canaries.append((request.execution_id + ":" + name, str(path)))
+        (workspace / "auth-link").symlink_to(policy.profile / "auth.json")
+        os.link(policy.root / "outside/canary", workspace / "auth-hardlink")
+        canaries.append((request.execution_id + ":hardlink", str(workspace / "auth-hardlink")))
+        unapproved = workspace / ".agents/skills/unapproved/SKILL.md"
+        unapproved.parent.mkdir(parents=True, mode=0o700)
+        unapproved.write_text("---\nname: unapproved\ndescription: synthetic unapproved\n---\nNever enable.\n")
+        canaries.append((request.execution_id + ":unapproved-skill", str(unapproved)))
+    for request in jobs:
+        workspace = request.workspace_path
+        cases = canaries + [("auth_alias", str(workspace / "auth-link")),
+                            ("parent_alias", str(workspace) + "/../../../outside/canary"),
+                            ("proc_self_auth", "/proc/self/root" + str(policy.profile / "auth.json")),
+                            ("proc_init_auth", "/proc/1/root" + str(policy.profile / "auth.json"))]
+        cases += [("sibling_" + other.execution_id, str(other.workspace_path / "inside-canary")) for other in jobs if other != request]
+        probe = """import json,pathlib,socket
+cases=CASES
+results={}
+for label,path in cases:
+    try:
+        pathlib.Path(path).read_bytes()
+        results[label]={'denied':False}
+    except OSError as error:
+        results[label]={'denied':True,'errno':error.errno}
+inside=pathlib.Path('inside-canary').read_text()=='ADF synthetic project canary'
+selected=SELECTED
+skill_read=(not selected or pathlib.Path(selected).read_text().endswith('Read the assigned marker.\\n'))
+try:
+    pathlib.Path('forbidden-write').write_text('synthetic')
+    write_denied=False
+except OSError:
+    write_denied=True
+try:
+    with socket.socket() as s:
+        s.settimeout(1)
+        s.connect(('127.0.0.1',9))
+    network_errno=None
+except OSError as error:
+    network_errno=error.errno
+print(json.dumps({'canaries':results,'inside_read':inside,'write_denied':write_denied,
+                  'network_errno':network_errno,'selected_skill_read':skill_read,'gate_passed':inside and skill_read and write_denied and all(v['denied'] for v in results.values()) and network_errno in (1,13)}))
+""".replace("CASES", repr(cases)).replace("SELECTED", repr(str(workspace / ".agents/skills/scoped/SKILL.md") if request.approved_skills else None))
+        (workspace / "native-probe.py").write_text(probe)
+    environment = {**restricted_env(), "CODEX_HOME": str(policy.profile), "ADF_TEST_NATIVE_ROOT": str(policy.root),
+                   "ADF_TEST_NATIVE_CODEX": str(vendor / "bin/codex")}
+    runtime, capture = server(mode="native-canary", root=policy.root, profile=policy.profile, policy=policy,
+                              native_policy=selected, environment=environment)
+    cancels = [Event() for _ in jobs]
+    results, errors = {}, []
+    def run(number):
+        try:
+            results[number] = policy_execute(runtime, jobs[number], cancels[number])
+        except Exception as error:
+            errors.append(error)
+    runners = [threading.Thread(target=run, args=(number,)) for number in range(3)]
+    for runner in runners:
+        runner.start()
+    until = time.monotonic() + 12
+    while len(wire_methods(capture, "turn/start")) < 3 and time.monotonic() < until:
+        time.sleep(0.02)
+    assert len(wire_methods(capture, "turn/start")) == 3
+    cancels[0].set()
+    for runner in runners:
+        runner.join(timeout=25)
+        assert not runner.is_alive()
+    assert not errors, errors
+    assert results[0].status == "cancelled"
+    for number in (1, 2):
+        assert results[number].status == "succeeded"
+        observed = json.loads(results[number].output)
+        assert observed["gate_passed"] is True, observed
+        assert observed["inside_read"] and observed["write_denied"] and observed["selected_skill_read"]
+        assert all(case["denied"] for case in observed["canaries"].values())
+    assert not any((request.workspace_path / "forbidden-write").exists() for request in jobs)
+    assert len(wire_methods(capture, "turn/interrupt")) == 1
+    for request in jobs:
+        check_receipt(runtime.root, Journal(request.journal_path).read())
+
+    observations = [row["summary"] for row in wire_methods(capture, "adf-test/native-metadata")]
+    assert len(observations) == 3
+    assert all(row["schema_validated"] and row["native_turn_calls"] == 0 for row in observations)
+    scoped = next(row for row in observations if row["cwd"] == str(jobs[1].workspace_path))
+    assert scoped["selected_skill_enabled"] and scoped["unapproved_skill_disabled"]
+    assert scoped["mcp_tools"] == ["read_marker"]
+
+
+@pytest.mark.parametrize("boundary", ["root", "profile", "home"])
+@pytest.mark.parametrize("system", ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/nix", "/run", "/mnt", "/"])
+def test_native_private_boundaries_cannot_overlap_system_grants(native_policy, monkeypatch, boundary, system):
+    from types import SimpleNamespace
+    from adf_runtime_worker import native_read_policy as module
+    original = native_policy.policy
+    values = {"root": original.root, "profile": original.profile, "manifest": original.manifest}
+    candidate = Path(system) / "synthetic-private" if system != "/" else Path("/")
+    if boundary == "home":
+        monkeypatch.setattr(Path, "home", lambda: candidate)
+    else:
+        values[boundary] = candidate
+    monkeypatch.setattr(module, "private_bytes", lambda *_: pytest.fail("Unsafe boundary read operator manifest"))
+    with pytest.raises(WorkerError) as error:
+        module.NativeReadPolicy(SimpleNamespace(**values), native_policy.manifest)
+    assert error.value.code == "PERMISSION_DENIED"

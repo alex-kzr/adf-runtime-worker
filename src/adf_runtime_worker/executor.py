@@ -11,7 +11,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any, cast
 from .adapters import provider_adapter
-from .capabilities import scoped_mcp, skill_snapshot
+from .capabilities import approved_capabilities
 from .git_workspace import GitWorkspaceManager, Workspace
 from .models import Adapter, EventSink, Json, Request, WorkerError
 from .process import ProcessRunner, disk_bytes
@@ -40,42 +40,8 @@ class Executor:
         if operation in {"review", "planner"}:
             profile = "observe"
         prompt = str(job.get("task_prompt", ""))
-        skills = tuple(skill_snapshot(item, self.workspaces.root, self.secret_values) for item in agent.get("skills", []))
-        if len({skill.name for skill in skills}) != len(skills):
-            raise WorkerError("INVALID_REQUEST", "Approved skill names must be unique")
-        mcp: Json = {}
-        for item in agent.get("mcp_servers", []):
-            name, config = scoped_mcp(item, workspace.path, max(1, int(self.execution_deadline - time.monotonic())))
-            if name in mcp:
-                raise WorkerError("INVALID_REQUEST", "MCP server names must be unique")
-            mcp[name] = config
-        provider = agent.get("provider", "mock")
-        mapped_tools: list[str] = []
-        for item in agent.get("tools", []):
-            manifest = item.get("manifest", item)
-            mappings = manifest.get("provider_mappings", {})
-            selected = mappings.get(provider)
-            if not isinstance(selected, list) or any(not isinstance(tool, str) for tool in selected):
-                raise WorkerError("CAPABILITY_UNSUPPORTED", "Tool registry needs verified provider mappings")
-            if profile != "trusted-development" and manifest.get("permission") != "read":
-                raise WorkerError("PERMISSION_DENIED", "Read-only role cannot inherit write/check tools")
-            if provider == "codex" and manifest.get("permission") != "read":
-                raise WorkerError("PERMISSION_DENIED", "Codex MCP registry requires read permission")
-            mapped_tools.extend(selected)
-        if provider in {"codex", "claude"}:
-            for name, config in mcp.items():
-                names = {"mcp__" + name + "__" + tool for tool in config["enabled_tools"]}
-                if agent.get("tools"):
-                    selected = names.intersection(mapped_tools)
-                    # A typed MCP registry narrows a server's approved catalog; never broadens it.
-                    config["enabled_tools"] = [tool for tool in config["enabled_tools"] if "mcp__" + name + "__" + tool in selected]
-                    if not config["enabled_tools"]:
-                        raise WorkerError("PERMISSION_DENIED", "Assigned MCP has no selected registry tools")
-                else:
-                    mapped_tools.extend(sorted(names))
-            if provider == "codex" and any(tool not in {"mcp__" + name + "__" + tool for name, config in mcp.items() for tool in config["enabled_tools"]} for tool in mapped_tools):
-                raise WorkerError("CAPABILITY_UNSUPPORTED", "Codex narrow registry supports only assigned scoped MCP tools")
-        provider_tools = mapped_tools if agent.get("tools") or agent.get("mcp_servers") else agent.get("allowed_tools", [])
+        skills, mcp, provider_tools = approved_capabilities(agent, self.workspaces.root, workspace.path,
+                                                           max(1, int(self.execution_deadline - time.monotonic())), profile, self.secret_values)
         schema = _PLAN_SCHEMA if operation == "planner" else _REVIEW_SCHEMA if operation == "review" else None
         if schema:
             prompt += "\nReturn only JSON matching this schema: " + json.dumps(schema)
