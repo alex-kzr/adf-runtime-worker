@@ -1,0 +1,10 @@
+{
+  "orchestrator_commit": "6fe7c1402864210fd8b6c2aed44695436c147f3f",
+  "request_builder_source_sha256": "ff2acb796a39c3338b91c6251ac9f950a1f16364ac7763deec6eb1b97b3027a8",
+  "source": "src/adf_orchestrator/engine.py:WorkflowEngine.intent",
+  "observed_run_id": "67398f61-5346-43c5-ba61-4be1ee0ba004",
+  "request": {
+    "operation": "agent_task",
+    "env_allowlist": ["PATH", "HOME", "LANG", "TERM"]
+  }
+}

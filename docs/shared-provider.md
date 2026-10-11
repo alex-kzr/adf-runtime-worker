@@ -34,6 +34,8 @@ Each existing detached supervisor launches an isolated Python bridge. Jobs have 
 
 The bridge fsyncs a generation/reference before allowing thread dispatch, then transfers the **same execution-lock inode** through SCM_RIGHTS. The provider holds that descriptor until quiescence. Bounds: three jobs, eight connections, 32 pending RPCs, 128 queued notifications per thread and 512 KiB per frame. Provider stderr is discarded/capped. Broker journals store IDs/paths/state, never prompts, wire payloads or raw errors. Only normalized approved output/tool metadata and token counts enter the existing redacted pipeline; private reasoning/tool arguments are omitted.
 
+The legacy orchestrator's exact `env_allowlist` sequence `["PATH", "HOME", "LANG", "TERM"]` is accepted as a compatibility marker and normalized to an empty per-job list before probing/materialization/bridge execution. It carries names only, never values; the owner keeps its fixed sanitized operator HOME/PATH and explicit private profile. Empty lists remain supported. Subsets, reordered/duplicate/extended lists, profile selectors, secret names and value-like entries are refused before probing or dispatch. No environment field is added to the broker protocol. A captured actual queue envelope plus an umbrella source-hash/AST contract binds this exception to orchestrator `6fe7c14`; offline wire tests prove the owner's environment remains unchanged and secret variables are absent. Native queued acceptance is a separate gate.
+
 ```mermaid
 sequenceDiagram
   participant S as Execution supervisor

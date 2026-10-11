@@ -18,7 +18,7 @@ from adf_runtime_worker.models import Request, SkillSnapshot, WorkerError
 from adf_runtime_worker.security import restricted_env
 from adf_runtime_worker.shared_adapter import SharedCodexAdapter
 from adf_runtime_worker.shared_job import bridge
-from adf_runtime_worker.shared_server import SharedServer, baseline, clean_config, job_path, native_event, shared_stopped
+from adf_runtime_worker.shared_server import SharedServer, baseline, clean_config, job_path, native_event, shared_stopped, server_command
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Linux Unix sockets, FD handoff and session proof")
 FAKE = Path(__file__).parent / "fixtures" / "shared_app_server.py"
@@ -27,12 +27,13 @@ FAKE = Path(__file__).parent / "fixtures" / "shared_app_server.py"
 @pytest.fixture
 def server(tmp_path):
     running = []
-    def start(mode="ready", root=None):
+    def start(mode="ready", root=None, environment=None, profile=None):
         root = root or tmp_path / ("root-" + str(len(running)))
         root.mkdir(exist_ok=True)
         root.chmod(0o700)
         capture = tmp_path / ("wire-" + str(len(running)) + ".jsonl")
-        runtime = SharedServer(root, [sys.executable, str(FAKE), str(capture), mode], restricted_env(), cleanup_timeout=0.7)
+        runtime = SharedServer(root, [sys.executable, str(FAKE), str(capture), mode],
+                               restricted_env() if environment is None else environment, profile=profile, cleanup_timeout=0.7)
         errors = []
         def run():
             try:
@@ -247,6 +248,68 @@ def test_shared_job_environment_and_permission_override_are_rejected(tmp_path):
     adapter = SharedCodexAdapter(tmp_path)
     with pytest.raises(WorkerError, match="environment"):
         adapter.argv(Request(str(uuid4()), str(uuid4()), 1, env_allowlist=("LANG",)), tmp_path)
+
+
+@pytest.mark.parametrize("names", [
+    ("HOME",), ("PATH", "HOME", "LANG"), ("HOME", "PATH", "LANG", "TERM"),
+    ("PATH", "HOME", "LANG", "TERM", "TERM"), ("PATH", "HOME", "LANG", "TERM", "TMPDIR"),
+    ("PATH", "HOME", "LANG", "TERM", "OPENAI_API_KEY"), ("CODEX_HOME",), ("CLAUDE_CONFIG_DIR",),
+    ("ADF_WORKER_TOKEN",), ("LANG=job-value",), ("path", "HOME", "LANG", "TERM"),
+])
+def test_shared_nonbaseline_environment_is_refused_before_probe_or_dispatch(tmp_path, monkeypatch, names):
+    adapter = SharedCodexAdapter(tmp_path)
+    def unexpected_probe(*_):
+        pytest.fail("Rejected job must not probe or launch the provider")
+    monkeypatch.setattr(adapter, "probe", unexpected_probe)
+    job = Request(str(uuid4()), str(uuid4()), 1, env_allowlist=names)
+    with pytest.raises(WorkerError) as error:
+        adapter.execute(job, lambda *_: None, Event())
+    assert error.value.code == "CAPABILITY_UNSUPPORTED"
+    with pytest.raises(WorkerError):
+        adapter.argv(job, tmp_path)
+    assert not list(tmp_path.iterdir())
+
+
+def test_actual_orchestrator_baseline_uses_fixed_operator_environment(server, tmp_path, monkeypatch):
+    from adf_runtime_worker.adapters import CodexAdapter
+    from adf_runtime_worker.profiles import ProviderProfile
+    fixture = json.loads((FAKE.parent / "orchestrator-6fe7c14-shared-envelope.json").read_text())
+    names = tuple(fixture["request"]["env_allowlist"])
+    home = tmp_path / "adf-worker"
+    profile = home / "ai-factory/provider-profiles/codex"
+    profile.mkdir(parents=True, mode=0o700)
+    node = home / "ai-factory/tools/node/bin/node"
+    node.parent.mkdir(parents=True)
+    node.write_text("synthetic executable; never invoked")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", "/mnt/c/unapproved:/usr/bin:/bin")
+    monkeypatch.setenv("ADF_NODE_PATH", str(node))
+    monkeypatch.setenv("CODEX_HOME", "/mnt/c/unapproved-profile")
+    for name in ("OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ADF_WORKER_TOKEN", "ADF_REDIS_PASSWORD"):
+        monkeypatch.setenv(name, "synthetic-private-value")
+    monkeypatch.setattr(CodexAdapter, "probe", lambda *_: {"health": "ready"})
+    _, environment, selected_profile = server_command("synthetic-codex", ProviderProfile("codex", profile))
+    runtime, capture = server(environment=environment, profile=selected_profile)
+    adapter = SharedCodexAdapter(runtime.root)
+    job = replace(request(runtime.root, tmp_path, 0), env_allowlist=names)
+    observed_requests = []
+    original_run = adapter.runner.run
+    def bridge_run(argv, effective, *args, **kwargs):
+        observed_requests.append(effective)
+        return original_run(argv, effective, *args, **kwargs)
+    monkeypatch.setattr(adapter.runner, "run", bridge_run)
+    with FileLock(runtime.root / "locks" / ("execution-" + job.execution_id + ".lock")) as lock:
+        result = adapter.execute(replace(job, lock_fd=lock.fd), lambda *_: None, Event())
+    assert result.status == "succeeded"
+    assert job.env_allowlist == names
+    assert len(observed_requests) == 1 and observed_requests[0].env_allowlist == ()
+    wire = [json.loads(line) for line in capture.read_text().splitlines()]
+    assert len([frame for frame in wire if frame["method"] == "turn/start"]) == 1
+    for frame in wire:
+        assert frame["environment"] == {"HOME": str(home), "PATH": str(node.parent) + ":/usr/bin:/bin", "CODEX_HOME": str(profile)}
+        assert not {"OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ADF_WORKER_TOKEN", "ADF_REDIS_PASSWORD"}.intersection(frame["environment_names"])
+        assert not {"env", "environment", "env_allowlist", "CODEX_HOME"}.intersection(frame["params"])
+    assert Journal(job_path(runtime.root, job.execution_id)).read()["proof"] == "thread_closed"
 
 
 def test_pinned_public_schema_accepts_generated_thread_and_turn_configuration(tmp_path):

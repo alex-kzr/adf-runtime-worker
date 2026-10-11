@@ -34,9 +34,18 @@ class SharedCodexAdapter(CodexAdapter):
         except (OSError, ValueError, WorkerError):
             return {"provider": "codex", "installed": False, "health": "blocked", "auth": "unknown", "backend": "shared"}
 
-    def argv(self, request: Request, config_dir: Path) -> list[str]:
+    @staticmethod
+    def _fixed_environment_request(request: Request) -> Request:
+        # The legacy orchestrator sends selectors, not environment values.
+        # This exact baseline uses the owner's fixed sanitized environment.
+        if request.env_allowlist == ("PATH", "HOME", "LANG", "TERM"):
+            return replace(request, env_allowlist=())
         if request.env_allowlist:
             raise WorkerError("CAPABILITY_UNSUPPORTED", "Shared Codex cannot apply per-job environment overrides")
+        return request
+
+    def argv(self, request: Request, config_dir: Path) -> list[str]:
+        request = self._fixed_environment_request(request)
         # Reuse the existing coarse sandbox and assigned-tool validation.
         super().argv(request, config_dir)
         if request.journal_path is None or request.lock_fd is None or request.workspace_path is None:
@@ -57,6 +66,7 @@ class SharedCodexAdapter(CodexAdapter):
                 "--journal", str(request.journal_path), "--lock-fd", str(request.lock_fd)]
 
     def execute(self, request: Request, event_sink: EventSink, cancellation: Event) -> AdapterResult:
+        request = self._fixed_environment_request(request)
         result = super().execute(request, event_sink, cancellation)
         data = Journal(request.journal_path).read() if request.journal_path else {}
         reference = data.get("shared_session")

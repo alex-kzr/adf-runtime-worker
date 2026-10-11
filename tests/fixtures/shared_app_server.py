@@ -41,7 +41,9 @@ for line in sys.stdin:
     method = message.get("method")
     params = message.get("params", {})
     with capture.open("a") as stream:
-        stream.write(json.dumps({"method": method, "params": params, "pid": os.getpid()}) + "\n")
+        stream.write(json.dumps({"method": method, "params": params, "pid": os.getpid(),
+                                "environment": {name: os.environ.get(name) for name in ("HOME", "PATH", "CODEX_HOME")},
+                                "environment_names": sorted(os.environ)}) + "\n")
     if "id" not in message:
         continue
     result = {}
