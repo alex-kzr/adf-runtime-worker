@@ -10,7 +10,8 @@ import sys
 import subprocess
 import tempfile
 import time
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
@@ -143,6 +144,25 @@ def _mcp_launch_configs(request: Request, directory: Path, *, claude: bool = Fal
         configs[name] = launch
     return configs
 
+
+@contextmanager
+def session_config(request: Request) -> Iterator[Path]:
+    """Retain launch files until a shared writer's quiescence is proven."""
+    directory = Path(tempfile.mkdtemp(prefix="adf-cli-config-", dir=request.journal_path.parent if request.journal_path else None))
+    directory.chmod(0o700)
+    try:
+        yield directory
+    finally:
+        from .journal import Journal
+        from .shared_server import shared_stopped
+        journal = Journal(request.journal_path) if request.journal_path else None
+        reference = journal.read().get("shared_session") if journal else None
+        if reference and not shared_stopped(reference):
+            if journal:
+                journal.update(retained_provider_config=str(directory))
+        else:
+            shutil.rmtree(directory)
+
 class SubprocessAdapter:
     provider = "unknown"
     pinned_version = ""
@@ -193,9 +213,7 @@ class SubprocessAdapter:
             raise WorkerError("EXECUTION_TIMEOUT", "Deadline exhausted during provider probe")
         if request.cli_version and request.cli_version != self.pinned_version:
             raise WorkerError("CLI_VERSION_MISMATCH", "Snapshot CLI version differs from adapter fixtures")
-        with tempfile.TemporaryDirectory(prefix="adf-cli-config-", dir=request.journal_path.parent if request.journal_path else None) as directory:
-            config_dir = Path(directory)
-            os.chmod(config_dir, 0o700)
+        with session_config(request) as config_dir:
             context: AbstractContextManager[tuple[Json, str]]
             if self.provider == "codex":
                 context = native_skills(request)

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import platform
+import signal
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,11 +63,17 @@ def main() -> None:
     serve.add_argument("--claude", default=os.getenv("ADF_CLAUDE_PATH"))
     serve.add_argument("--codex-home", type=Path, help="Existing private persistent Codex profile; no login or credential copy")
     serve.add_argument("--claude-config-dir", type=Path, help="Existing private persistent Claude profile; no token generation")
+    serve.add_argument("--codex-backend", choices=("subprocess", "shared"), default="subprocess")
+    server = sub.add_parser("provider-server", help="Run one persistent pinned Codex app-server; no login")
+    server.add_argument("--root", type=Path, required=True)
+    server.add_argument("--codex", required=True)
+    server.add_argument("--codex-home", type=Path, required=True)
+    server.add_argument("--node", default=os.getenv("ADF_NODE_PATH", str(Path.home() / ".local" / "bin" / "node")))
     supervise = sub.add_parser("supervise", help=argparse.SUPPRESS)
     supervise.add_argument("--ticket", type=Path, required=True)
     args = parser.parse_args()
     try:
-        if args.command in {"doctor", "serve"}:
+        if args.command in {"doctor", "serve", "provider-server"}:
             node = Path(args.node)
             if not node.is_absolute() or str(node.resolve()).startswith("/mnt/"):
                 raise WorkerError("INVALID_PATH", "Node runtime must be an explicit Linux executable")
@@ -75,10 +82,20 @@ def main() -> None:
             print(json.dumps(doctor(args.root, {key: value for key, value in {"codex": args.codex, "claude": args.claude}.items() if value})))
         elif args.command == "supervise":
             supervise_ticket(args.ticket)
+        elif args.command == "provider-server":
+            from .profiles import ProviderProfile
+            from .security import canonical_root
+            from .shared_server import SharedServer, server_command
+            root = canonical_root(args.root)
+            argv, environment, profile = server_command(args.codex, ProviderProfile("codex", args.codex_home))
+            runtime = SharedServer(root, argv, environment, profile=profile)
+            signal.signal(signal.SIGTERM, lambda *_: runtime.stopping.set())
+            signal.signal(signal.SIGINT, lambda *_: runtime.stopping.set())
+            runtime.run()
         elif args.command == "serve":
             if not args.token_file or not args.redis_password_file:
                 raise WorkerError("AUTH_REQUIRED", "Separate worker token and Redis password files are required")
-            WorkerService(args.root, args.api_url, args.token_file, args.redis_url, args.redis_password_file, max_parallel=args.max_parallel, provider_paths={key: value for key, value in {"codex": args.codex, "claude": args.claude}.items() if value}, provider_profiles={key: str(value) for key, value in {"codex": args.codex_home, "claude": args.claude_config_dir}.items() if value}, project_roots=args.project_root).run()
+            WorkerService(args.root, args.api_url, args.token_file, args.redis_url, args.redis_password_file, max_parallel=args.max_parallel, provider_paths={key: value for key, value in {"codex": args.codex, "claude": args.claude}.items() if value}, provider_profiles={key: str(value) for key, value in {"codex": args.codex_home, "claude": args.claude_config_dir}.items() if value}, codex_backend=args.codex_backend, project_roots=args.project_root).run()
         else:
             body = json.loads(args.request.read_text(encoding="utf-8"))
             sequence = 0

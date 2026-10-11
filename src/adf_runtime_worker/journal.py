@@ -171,6 +171,10 @@ def group_alive(identity: dict[str, Any]) -> bool:
 
 def owned_sessions_stopped(saved: dict[str, Any]) -> bool:
     identities = [saved.get("process", {}), saved.get("terminal_result", {}).get("process_identity", {}), *saved.get("owned_sessions", [])]
+    if saved.get("shared_session"):
+        from .shared_server import shared_stopped
+        if not shared_stopped(saved["shared_session"]):
+            return False
     return not any(group_alive(identity) for identity in identities)
 
 

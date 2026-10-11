@@ -40,7 +40,7 @@ uv pip install --python .venv/bin/python -r requirements-dev.lock
 
 Linux tests exercise real process groups and Git in temporary dedicated repositories. They cover output/time/lease quotas, stubborn descendants, redaction, path escape, exclusive locks, independent review, tree-bound checks, commit intent recovery, dependency snapshots, fresh repair attempts and integration conflict preservation. Live provider smoke belongs to umbrella acceptance, uses a dedicated trusted test repository and consumes the user's subscription only when authorized.
 
-Read [host runtime design and limitations](docs/development.md). The public origin is [adf-runtime-worker](https://github.com/alex-kzr/adf-runtime-worker).
+Read [host runtime design and limitations](docs/development.md) and [persistent profiles/shared Codex migration](docs/shared-provider.md). The opt-in `serve --codex-backend shared` uses one separately started `provider-server`, independent native threads and additional writer quiescence proofs. Subprocess mode remains the compatible default; native shared-model acceptance is pending. The public origin is [adf-runtime-worker](https://github.com/alex-kzr/adf-runtime-worker).
 
 ## Shared design
 

@@ -75,20 +75,28 @@ def native_skills(request: Request) -> Iterator[tuple[Json, str]]:
         prompt = "Use the approved native skills: " + " ".join("$" + skill.name for skill in request.approved_skills) + "\n" + request.task_prompt
         yield {"config": rules, "bundled": {"enabled": False}, "include_instructions": True}, prompt
     finally:
-        changed = False
-        for source, expected in reversed(created_files):
-            try:
-                within_root(source, workspace)
-                with source.open("rb") as content:
-                    changed |= source.is_symlink() or hashlib.sha256(content.read(32769)).hexdigest() != expected
-                source.unlink()
-            except (OSError, WorkerError):
-                changed = True
-        for directory in reversed(created_dirs):
-            try:
-                within_root(directory, workspace)
-                directory.rmdir()
-            except (OSError, WorkerError):
-                changed = True
-        if changed:
-            raise WorkerError("PERMISSION_DENIED", "Provider modified approved skill materialization; retained residual evidence")
+        from .journal import Journal
+        from .shared_server import shared_stopped
+        journal = Journal(request.journal_path) if request.journal_path else None
+        reference = journal.read().get("shared_session") if journal else None
+        if reference and not shared_stopped(reference):
+            if journal:
+                journal.update(retained_native_skills=[str(source) for source, _ in created_files])
+        else:
+            changed = False
+            for source, expected in reversed(created_files):
+                try:
+                    within_root(source, workspace)
+                    with source.open("rb") as content:
+                        changed |= source.is_symlink() or hashlib.sha256(content.read(32769)).hexdigest() != expected
+                    source.unlink()
+                except (OSError, WorkerError):
+                    changed = True
+            for directory in reversed(created_dirs):
+                try:
+                    within_root(directory, workspace)
+                    directory.rmdir()
+                except (OSError, WorkerError):
+                    changed = True
+            if changed:
+                raise WorkerError("PERMISSION_DENIED", "Provider modified approved skill materialization; retained residual evidence")
