@@ -40,6 +40,9 @@ class GitWorkspaceManager:
 
     def git(self, path: Path, *args: str, check: bool = True) -> str:
         within_root(path, self.root)
+        if self.execution_journal:
+            from .profile_policy import check_receipt
+            check_receipt(self.root, self.execution_journal.read())
         return self._command([self.executable, "-c", "core.quotePath=false", "-C", str(path), *args], check=check)
 
     def _command(self, argv: list[str], *, check: bool = True) -> str:
@@ -203,7 +206,7 @@ class GitWorkspaceManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         within_root(path, self.root, must_exist=False)
         with self.project_lock(request["project_id"]):
-            journal.update(allocation_intent={"path": str(path), "branch": branch, "root_base_sha": root_sha}, project_id=request["project_id"], run_id=request["run_id"], task_id=request["task_id"], execution_id=execution_id)
+            journal.update(allocation_intent={"path": str(path), "branch": branch, "root_base_sha": root_sha}, repository_root=str(repo), project_id=request["project_id"], run_id=request["run_id"], task_id=request["task_id"], execution_id=execution_id)
             # A prior allocation_intent is reconciled using the exact branch/path, never deleted.
             if path.exists():
                 if self.git(path, "symbolic-ref", "--short", "HEAD") != branch or self.git(path, "rev-parse", "HEAD") != root_sha:
@@ -255,6 +258,8 @@ class GitWorkspaceManager:
         return {"tree_sha": tree, "changed_paths": paths, "diff_sha256": hashlib.sha256(diff.encode()).hexdigest()}
 
     def commit(self, workspace: Workspace, request: Json) -> Json:
+        from .profile_policy import check_receipt
+        check_receipt(self.root, workspace.journal.read())
         policy = request.get("policy", {})
         if not policy.get("approved") or not policy.get("allow_commit"):
             raise WorkerError("PERMISSION_DENIED", "Commit requires an approved bounded grant")
@@ -300,6 +305,9 @@ class GitWorkspaceManager:
             raise WorkerError("EXECUTION_UNCERTAIN", "Commit outcome does not match fsynced intent")
 
     def _apply_delta(self, workspace: Workspace, sha: str, key: str) -> str:
+        from .profile_policy import check_receipt, inherit_receipt
+        inherit_receipt(self.root, workspace.journal, source_sha=sha)
+        check_receipt(self.root, workspace.journal.read())
         if not _SHA.fullmatch(sha):
             raise WorkerError("INVALID_REQUEST", "Integration requires exact commit IDs")
         saved = workspace.journal.read()

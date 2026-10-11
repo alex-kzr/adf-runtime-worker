@@ -80,6 +80,7 @@ def main() -> None:
     server.add_argument("--root", type=Path, required=True)
     server.add_argument("--codex", required=True)
     server.add_argument("--codex-home", type=Path, required=True)
+    server.add_argument("--shared-profile-policy", type=Path, help="Private operator-only exact project trust manifest; no config writes")
     server.add_argument("--node", default=os.getenv("ADF_NODE_PATH", str(Path.home() / ".local" / "bin" / "node")))
     supervise = sub.add_parser("supervise", help=argparse.SUPPRESS)
     supervise.add_argument("--ticket", type=Path, required=True)
@@ -101,9 +102,13 @@ def main() -> None:
             from .profiles import ProviderProfile
             from .security import canonical_root
             from .shared_server import SharedServer, server_command
+            from .profile_policy import SealedProfilePolicy
             root = canonical_root(args.root)
-            argv, environment, profile = server_command(args.codex, ProviderProfile("codex", args.codex_home))
-            runtime = SharedServer(root, argv, environment, profile=profile)
+            selected = ProviderProfile("codex", args.codex_home)
+            selected.environment()
+            policy = SealedProfilePolicy(root, args.codex_home, args.shared_profile_policy) if args.shared_profile_policy else None
+            argv, environment, profile = server_command(args.codex, selected, policy)
+            runtime = SharedServer(root, argv, environment, profile=profile, policy=policy)
             signal.signal(signal.SIGTERM, lambda *_: runtime.stopping.set())
             signal.signal(signal.SIGINT, lambda *_: runtime.stopping.set())
             runtime.run()

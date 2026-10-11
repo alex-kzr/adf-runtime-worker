@@ -66,7 +66,7 @@ for line in sys.stdin:
         if mode == "crash":
             os._exit(13)
         def run(thread_id=thread_id, turn_id=turn_id, cancelled=cancelled):
-            cancelled.wait(0.6)
+            cancelled.wait(3 if mode in {"slow", "slow-no-close"} else 0.6)
             complete(thread_id, turn_id, cancelled)
         threading.Thread(target=run, daemon=True).start()
         continue
@@ -74,7 +74,7 @@ for line in sys.stdin:
         turns[params["threadId"]].set()
     elif method == "thread/unsubscribe":
         send({"id": message["id"], "result": {"status": "unsubscribed"}})
-        if mode != "no-close":
+        if mode not in {"no-close", "slow-no-close"}:
             notify("thread/closed", {"threadId": params["threadId"]})
         continue
     send({"id": message["id"], "result": result})

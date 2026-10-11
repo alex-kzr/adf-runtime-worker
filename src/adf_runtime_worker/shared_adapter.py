@@ -79,4 +79,10 @@ class SharedCodexAdapter(CodexAdapter):
                 return replace(result, status="uncertain", error_code="EXECUTION_UNCERTAIN")
             if job.get("status") == "failed" and result.status == "failed":
                 return replace(result, error_code=str(job.get("code") or "PROVIDER_FAILED"))
+        if result.status == "succeeded" and request.workspace_path:
+            from .profile_policy import check_receipt
+            try:
+                check_receipt(self.root, Journal(self.root / "journals" / (request.workspace_path.name + ".json")).read())
+            except WorkerError:
+                return replace(result, status="failed", error_code="PERMISSION_DENIED", output="")
         return result

@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 from .journal import FileLock, Journal, process_identity, process_stopped, stop_owned_session
 from .models import WorkerError
 from .profiles import ProviderProfile
+from .profile_policy import SealedProfilePolicy
 from .security import restricted_env
 from .shared_rpc import FRAME_LIMIT, Rpc
 
@@ -89,11 +90,11 @@ def peer_uid(connection: socket.socket) -> int:
 def clean_config(profile: Path, workspace: Path | None = None) -> None:
     # app-server 0.157 has no exec --ignore-user-config/--ignore-rules switches.
     # Reject those layers instead of pretending equivalent isolation exists.
-    if any((profile / name).exists() for name in ("config.toml", "rules", "skills", "AGENTS.md", "environments.toml")):
+    if any(os.path.lexists(profile / name) for name in ("config.toml", "rules", "skills", "AGENTS.md", "environments.toml")):
         raise WorkerError("PERMISSION_DENIED", "Shared Codex requires an operator profile without configuration or policy layers")
     if workspace:
         for ancestor in (workspace, *workspace.parents):
-            if (ancestor / ".codex").exists() and ancestor / ".codex" != profile:
+            if os.path.lexists(ancestor / ".codex") and ancestor / ".codex" != profile:
                 raise WorkerError("PERMISSION_DENIED", "Shared job cannot inherit project or ancestor Codex configuration")
 
 
@@ -118,9 +119,12 @@ def native_event(message: dict[str, Any]) -> dict[str, Any] | None:
 
 class SharedServer:
     def __init__(self, root: Path, argv: list[str], environment: dict[str, str], *, profile: Path | None = None,
-                 cleanup_timeout: float = 20) -> None:
+                 cleanup_timeout: float = 20, policy: SealedProfilePolicy | None = None) -> None:
         self.root, self.argv, self.environment = root, argv, environment
         self.profile = profile
+        self.policy = policy
+        self.dispatch_lock = policy.lock if policy else threading.RLock()
+        self.policy_blocked = threading.Event()
         self.directory = root / "providers" / "codex"
         self.socket_path = self.directory / "server.sock"
         self.state = Journal(self.directory / "server.json")
@@ -135,6 +139,25 @@ class SharedServer:
         self.retained_lock = threading.Lock()
         self.process: subprocess.Popen[bytes] | None = None
         self.rpc: Rpc | None = None
+
+    def _check_policy(self) -> None:
+        if self.policy_blocked.is_set():
+            raise WorkerError("PERMISSION_DENIED", "Shared operator policy generation is blocked")
+        if self.policy:
+            try:
+                self.policy.check()
+            except WorkerError:
+                self.policy_blocked.set()
+                self.state.update(policy_blocked=True)
+                raise
+
+    def _monitor_policy(self) -> None:
+        while not self.stopping.wait(0.05):
+            # Do not wait for a slow native start: running siblings must fence.
+            try:
+                self._check_policy()
+            except WorkerError:
+                return
 
     def _recover(self) -> None:
         old = self.state.read()
@@ -155,9 +178,12 @@ class SharedServer:
         private_directory(self.directory / "jobs")
         with FileLock(self.root / "locks" / "provider-codex.lock"):
             self._recover()
-            if self.profile:
+            if self.policy:
+                self.policy.check()
+            elif self.profile:
                 clean_config(self.profile)
-            self.state.update(generation=self.generation, owner=process_identity(os.getpid()), server=None, stopped=False)
+            self.state.update(generation=self.generation, owner=process_identity(os.getpid()), server=None, stopped=False, policy_blocked=False)
+            monitor: threading.Thread | None = None
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 self.process = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -167,6 +193,11 @@ class SharedServer:
                 self.rpc = Rpc(self.process)
                 self.rpc.call("initialize", {"clientInfo": {"name": "adf-worker", "version": "0.1.0"}})
                 self.rpc.send({"method": "initialized", "params": {}})
+                if self.policy:
+                    with self.dispatch_lock:
+                        self._check_policy()
+                    monitor = threading.Thread(target=self._monitor_policy, daemon=True)
+                    monitor.start()
                 if self.socket_path.exists():
                     if not stat.S_ISSOCK(self.socket_path.lstat().st_mode):
                         raise WorkerError("PERMISSION_DENIED", "Shared provider socket path is occupied")
@@ -189,6 +220,8 @@ class SharedServer:
                     handler.start()
             finally:
                 self.stopping.set()
+                if monitor:
+                    monitor.join(timeout=3)
                 listener.close()
                 for handler in self.handlers:
                     handler.join(timeout=self.cleanup_timeout + 2)
@@ -231,8 +264,14 @@ class SharedServer:
             frame = recv_frame(connection)
             if frame.get("op") == "health":
                 auth = self.rpc.call("account/read", {"refreshToken": False})
-                ready = bool(auth.get("account")) and not self.auth_blocked.is_set()
-                send_frame(connection, {"health": "ready" if ready else "blocked", "auth": "ready" if ready else "required", "generation": self.generation})
+                authenticated = bool(auth.get("account")) and not self.auth_blocked.is_set()
+                with self.dispatch_lock:
+                    try:
+                        self._check_policy()
+                    except WorkerError:
+                        pass
+                ready = authenticated and not self.policy_blocked.is_set()
+                send_frame(connection, {"health": "ready" if ready else "blocked", "auth": "ready" if authenticated else "required", "generation": self.generation})
                 return
             if frame.get("op") != "job":
                 raise WorkerError("INVALID_REQUEST", "Unknown shared operation")
@@ -260,7 +299,11 @@ class SharedServer:
                 raise WorkerError("PERMISSION_DENIED", "Shared job requires its inherited worktree lock")
             fd = descriptors[0]
             os.set_inheritable(fd, False)
-            expected = (self.root / "locks" / ("execution-" + frame["execution_id"] + ".lock")).lstat()
+            lock_id = self.policy.target(frame["execution_id"]) if self.policy else frame["execution_id"]
+            try:
+                expected = (self.root / "locks" / ("execution-" + lock_id + ".lock")).lstat()
+            except OSError as exc:
+                raise WorkerError("PERMISSION_DENIED", "Shared job allocation lock is unavailable") from exc
             received_info = os.fstat(fd)
             if (not stat.S_ISREG(expected.st_mode) or received_info.st_ino != expected.st_ino or received_info.st_dev != expected.st_dev
                     or received_info.st_uid != os.geteuid() or received_info.st_nlink != 1):
@@ -276,9 +319,9 @@ class SharedServer:
             params = frame["start"]
             workspace = Path(params["cwd"])
             if (not workspace.is_absolute() or workspace.resolve() != workspace or str(workspace).startswith("/mnt/")
-                    or not workspace.is_relative_to(self.root / "worktrees") or workspace.name != frame["execution_id"]):
+                    or not workspace.is_relative_to(self.root / "worktrees") or (self.policy is None and workspace.name != frame["execution_id"])):
                 raise WorkerError("PERMISSION_DENIED", "Shared job needs a canonical Linux worktree")
-            if self.profile:
+            if self.profile and self.policy is None:
                 clean_config(self.profile, workspace)
             if params.get("approvalPolicy") != "never" or params.get("ephemeral") is not True or params.get("sandbox") not in {"workspace-write", "read-only"}:
                 raise WorkerError("PERMISSION_DENIED", "Shared thread permissions are invalid")
@@ -300,14 +343,23 @@ class SharedServer:
                 if (source.resolve() != source or not source.is_relative_to(self.root / "journals") or not stat.S_ISREG(info.st_mode)
                         or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
                     raise WorkerError("PERMISSION_DENIED", "Shared MCP configuration is not a private journal-scoped file")
-            journal.update(status="thread_spawn_intent")
-            started = self.rpc.call("thread/start", params)
-            thread_id = str(started["thread"]["id"])
-            journal.update(thread_id=thread_id, status="starting")
-            events = self.rpc.subscribe(thread_id)
-            turn = self.rpc.call("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": frame["prompt"]}], "outputSchema": frame.get("schema")})
-            turn_id = str(turn["turn"]["id"])
-            journal.update(turn_id=turn_id, status="running")
+            with self.dispatch_lock:
+                self._check_policy()
+                if self.policy:
+                    self.policy.bind(frame["execution_id"], workspace, self.generation)
+                    # The client was validated above; only the owner adds trust.
+                    params = {**params, "config": {**config, "projects": self.policy.projects}}
+                self._check_policy()
+                journal.update(status="thread_spawn_intent")
+                started = self.rpc.call("thread/start", params)
+                thread_id = str(started["thread"]["id"])
+                journal.update(thread_id=thread_id, status="starting")
+                events = self.rpc.subscribe(thread_id)
+                self._check_policy()
+                turn = self.rpc.call("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": frame["prompt"]}], "outputSchema": frame.get("schema")})
+                turn_id = str(turn["turn"]["id"])
+                journal.update(turn_id=turn_id, status="running")
+                self._check_policy()
             send_frame(connection, {"event": {"type": "thread.started", "thread_id": thread_id}})
             connection.settimeout(0.1)
             disconnected = False
@@ -317,6 +369,7 @@ class SharedServer:
             cancel_deadline = float("inf")
             usage: dict[str, Any] = {}
             while not finished and not self.rpc.failed.is_set():
+                self._check_policy()
                 try:
                     command = connection.recv(1)
                     if not command or command == b"C":
@@ -370,7 +423,7 @@ class SharedServer:
                 # Even failures after thread/start must close the owned thread.
                 if thread_id and self.rpc and not self.rpc.failed.is_set():
                     try:
-                        if turn_id and status == "uncertain":
+                        if turn_id and (status == "uncertain" or self.policy_blocked.is_set()):
                             self.rpc.call("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=3)
                         self.rpc.call("thread/unsubscribe", {"threadId": thread_id}, timeout=3)
                         until = time.monotonic() + self.cleanup_timeout
@@ -389,8 +442,14 @@ class SharedServer:
                     closed = journal.read().get("status") == "accepted"
                 if not closed:
                     status, code = "uncertain", "EXECUTION_UNCERTAIN"
-                journal.update(status=status, code=None if status == "succeeded" else code, quiesced=closed,
-                               proof="thread_closed" if closed and thread_id else "no_thread" if closed else None)
+                with self.dispatch_lock:
+                    try:
+                        self._check_policy()
+                    except WorkerError:
+                        if closed:
+                            status, code = "failed", "PERMISSION_DENIED"
+                    journal.update(status=status, code=None if status == "succeeded" else code, quiesced=closed,
+                                   proof="thread_closed" if closed and thread_id else "no_thread" if closed else None)
                 if thread_id and self.rpc:
                     self.rpc.forget(thread_id)
                 if fd is not None:
@@ -414,16 +473,25 @@ class SharedServer:
             self.connections.release()
 
 
-def server_command(executable: str, profile: ProviderProfile) -> tuple[list[str], dict[str, str], Path]:
+def server_command(executable: str, profile: ProviderProfile, policy: SealedProfilePolicy | None = None) -> tuple[list[str], dict[str, str], Path]:
     from .adapters import CodexAdapter
     from .capabilities import toml_value
-    health = CodexAdapter(executable, profile).probe()
-    if health.get("health") != "ready":
-        raise WorkerError("AUTH_REQUIRED" if health.get("pin_matches") is not False else "CLI_VERSION_MISMATCH", "Pinned shared provider must be authenticated by its operator")
     if profile.directory is None:
         raise WorkerError("PERMISSION_DENIED", "Shared backend requires an explicit private operator profile")
     environment = {**restricted_env(), **profile.environment()}
+    if policy:
+        if policy.profile != profile.directory:
+            raise WorkerError("PERMISSION_DENIED", "Shared policy profile differs from the operator profile")
+        policy.check()
+    else:
+        clean_config(profile.directory)
+    health = CodexAdapter(executable, profile).probe()
+    if health.get("health") != "ready":
+        raise WorkerError("AUTH_REQUIRED" if health.get("pin_matches") is not False else "CLI_VERSION_MISMATCH", "Pinned shared provider must be authenticated by its operator")
     argv = [executable, "app-server", "--strict-config", "--listen", "stdio://"]
     for name, value in baseline().items():
         argv += ["-c", name + "=" + toml_value(value)]
+    if policy:
+        policy.check()
+        argv += ["-c", "projects=" + toml_value(policy.projects)]
     return argv, environment, profile.directory

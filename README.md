@@ -45,6 +45,8 @@ Linux tests exercise real process groups and Git in temporary dedicated reposito
 
 Read [host runtime design and limitations](docs/development.md) and [persistent profiles/shared Codex migration](docs/shared-provider.md). The opt-in `serve --codex-backend shared` uses one separately started `provider-server`, independent native threads and additional writer quiescence proofs. Subprocess mode remains the compatible default; native shared-model acceptance is pending. The public origin is [adf-runtime-worker](https://github.com/alex-kzr/adf-runtime-worker).
 
+The operator-only [sealed shared-profile policy](docs/shared-profile-policy.md) permits an exact trust-only baseline through `provider-server --shared-profile-policy`. Its owner CLI override avoids the pinned automatic trust write; immutable receipts fence drift and later Git copies/commits. The default continues to reject user configuration. This source feature is not a runtime deployment or a native acceptance result.
+
 ## Shared design
 
 - [Architecture](../../docs/architecture.md)

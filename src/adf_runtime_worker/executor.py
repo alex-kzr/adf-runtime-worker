@@ -97,6 +97,9 @@ class Executor:
                 raise WorkerError("CANCEL_REQUESTED", "Cancellation prevents further Git operations")
             if lease_deadline and time.monotonic() >= lease_deadline() - 5:
                 raise WorkerError("LEASE_LOST", "Lease prevents further Git operations")
+            from .profile_policy import check_receipt
+            target = str(job.get("target_execution_id") or job["execution_id"])
+            check_receipt(self.workspaces.root, self.workspaces.journal_for(target).read())
         self.workspaces.control_guard = guard
         name = "test.run" if operation == "test" else "git.operation" if operation in {"repo_inspect", "git_commit", "integrate"} else "agent.execution"
         with span(name, job) as current:
@@ -168,6 +171,9 @@ class Executor:
                     raise WorkerError("PERMISSION_DENIED", "Agent changed Git HEAD; preserved for inspection")
                 if outcome.status != "succeeded":
                     return evidence
+                guard = self.workspaces.control_guard
+                if guard:
+                    guard()
                 if operation == "agent_task":
                     evidence.update(self.workspaces.changes(workspace, allowed_paths))
                     workspace.journal.update(development_result=evidence)
@@ -230,6 +236,8 @@ class Executor:
             raise WorkerError("IDEMPOTENCY_CONFLICT", "Repair requires a fresh allocation")
         with self.workspaces.worktree_lock(source_id):
             source = self.workspaces.load(source_id)
+            from .profile_policy import inherit_receipt
+            inherit_receipt(self.workspaces.root, workspace.journal, source_id=source_id)
             saved = source.journal.read()
             if saved.get("project_id") != job["project_id"] or saved.get("run_id") != job["run_id"] or source.root_base_sha != workspace.root_base_sha or not owned_sessions_stopped(saved):
                 raise WorkerError("EXECUTION_UNCERTAIN", "Repair source has invalid ownership")

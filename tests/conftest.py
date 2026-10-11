@@ -1,5 +1,6 @@
 from pathlib import Path
 import subprocess
+import json
 import pytest
 from adf_runtime_worker.git_workspace import GitWorkspaceManager
 
@@ -28,3 +29,15 @@ def manager(repository):
 def job(repository):
     _, _, sha, project = repository
     return {"execution_id": "execution-1", "run_id": "run-1", "task_id": "task-1", "project_id": "project-1", "lease_epoch": 1, "operation": "agent_task", "root_base_sha": sha, "execution_base_sha": sha, "project": project, "agent": {"id": "developer", "provider": "mock", "permission_profile": "trusted-development"}, "policy": {"approved": True, "allow_commit": True, "trusted_repository": True, "allowed_write_paths": ["feature.py"]}, "allowed_write_paths": ["feature.py"], "check_ids": ["python"], "task_prompt": '{"mock_files":{"feature.py":"value = 42\\n"}}', "timeout_sec": 10, "max_steps": 20, "max_output_bytes": 100000, "max_disk_bytes": 1000000}
+
+@pytest.fixture
+def sealed_policy(repository):
+    from adf_runtime_worker.profile_policy import SealedProfilePolicy
+    root, repo, _, _ = repository
+    profile = root / "provider-profiles" / "codex"
+    profile.mkdir(parents=True, mode=0o700)
+    manifest = root / "tools" / "shared-profile-policy.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({"version": 1, "project_roots": [str(repo)]}))
+    manifest.chmod(0o600)
+    return SealedProfilePolicy(root, profile, manifest)

@@ -19,6 +19,8 @@ from adf_runtime_worker.security import restricted_env
 from adf_runtime_worker.shared_adapter import SharedCodexAdapter
 from adf_runtime_worker.shared_job import bridge
 from adf_runtime_worker.shared_server import SharedServer, baseline, clean_config, job_path, native_event, shared_stopped, server_command
+from adf_runtime_worker.profile_policy import SealedProfilePolicy, check_receipt
+from adf_runtime_worker.git_workspace import GitWorkspaceManager
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Linux Unix sockets, FD handoff and session proof")
 FAKE = Path(__file__).parent / "fixtures" / "shared_app_server.py"
@@ -27,13 +29,13 @@ FAKE = Path(__file__).parent / "fixtures" / "shared_app_server.py"
 @pytest.fixture
 def server(tmp_path):
     running = []
-    def start(mode="ready", root=None, environment=None, profile=None):
+    def start(mode="ready", root=None, environment=None, profile=None, policy=None):
         root = root or tmp_path / ("root-" + str(len(running)))
         root.mkdir(exist_ok=True)
         root.chmod(0o700)
         capture = tmp_path / ("wire-" + str(len(running)) + ".jsonl")
         runtime = SharedServer(root, [sys.executable, str(FAKE), str(capture), mode],
-                               restricted_env() if environment is None else environment, profile=profile, cleanup_timeout=0.7)
+                               restricted_env() if environment is None else environment, profile=profile, cleanup_timeout=0.7, policy=policy)
         errors = []
         def run():
             try:
@@ -64,6 +66,245 @@ def request(root, tmp_path, number):
     Journal(journal).update(phase="test_allocated")
     return Request(execution_id, str(uuid4()), 1, workspace_path=workspace, task_prompt="offline job",
                    timeout_sec=4, journal_path=journal, permission_profile="trusted-development", model="model-" + str(number))
+
+
+def policy_request(policy, job, number=0):
+    allocation = {**job, "execution_id": str(uuid4()), "run_id": str(uuid4()), "task_id": str(uuid4()), "project_id": str(uuid4())}
+    workspace = GitWorkspaceManager(policy.root, require_ext4=False).allocate(allocation)
+    return Request(allocation["execution_id"], allocation["run_id"], 1, workspace.path, "synthetic policy job", 8,
+                   journal_path=workspace.journal.path, permission_profile="trusted-development", model="model-" + str(number))
+
+
+def policy_execute(runtime, job, cancellation=None):
+    target = job.workspace_path.name
+    with FileLock(runtime.root / "locks" / ("execution-" + target + ".lock")) as lock:
+        return SharedCodexAdapter(runtime.root).execute(replace(job, lock_fd=lock.fd), lambda *_: None, cancellation or Event())
+
+
+def wire_methods(capture, method):
+    return [json.loads(line) for line in capture.read_text().splitlines() if json.loads(line)["method"] == method]
+
+
+def test_policy_three_allocations_use_owner_trust_without_config_write(server, sealed_policy, job):
+    policy = sealed_policy
+    runtime, capture = server(root=policy.root, profile=policy.profile, policy=policy)
+    jobs = [policy_request(policy, job, number) for number in range(3)]
+    results = {}
+    runners = [threading.Thread(target=lambda n=n: results.update({n: policy_execute(runtime, jobs[n])})) for n in range(3)]
+    for runner in runners:
+        runner.start()
+    for runner in runners:
+        runner.join(timeout=12)
+        assert not runner.is_alive()
+    assert [results[n].status for n in range(3)] == ["succeeded"] * 3
+    starts = wire_methods(capture, "thread/start")
+    assert len(starts) == 3
+    assert len({start["params"]["cwd"] for start in starts}) == 3
+    assert all(start["params"]["config"]["projects"] == policy.projects for start in starts)
+    assert not (policy.profile / "config.toml").exists()
+    policy.check()
+    for request in jobs:
+        check_receipt(policy.root, Journal(request.journal_path).read())
+
+
+def test_policy_review_dispatch_uses_target_allocator_and_target_lock(server, sealed_policy, job):
+    policy = sealed_policy
+    runtime, capture = server(root=policy.root, profile=policy.profile, policy=policy)
+    target = policy_request(policy, job)
+    dispatch_id = str(uuid4())
+    journal = policy.root / "journals" / (dispatch_id + ".json")
+    Journal(journal).update(execution_id=dispatch_id, request={"target_execution_id": target.execution_id})
+    review = replace(target, execution_id=dispatch_id, journal_path=journal, permission_profile="observe")
+    assert policy_execute(runtime, review).status == "succeeded"
+    assert wire_methods(capture, "thread/start")[0]["params"]["cwd"] == str(target.workspace_path)
+    assert wire_methods(capture, "thread/start")[0]["params"]["sandbox"] == "read-only"
+
+
+@pytest.mark.parametrize("fault", ["allocator", "main-root", "ancestor", "worktree-layer", "dispatch-target"])
+def test_policy_binding_faults_fail_before_native_start(server, sealed_policy, job, fault):
+    policy = sealed_policy
+    runtime, capture = server(root=policy.root, profile=policy.profile, policy=policy)
+    request = policy_request(policy, job)
+    journal = Journal(request.journal_path)
+    if fault == "allocator":
+        journal.update(workspace={**journal.read()["workspace"], "path": str(policy.repositories[0])})
+    elif fault == "main-root":
+        journal.update(repository_root=str(policy.root / "projects"))
+    elif fault == "ancestor":
+        (policy.repositories[0].parent / ".codex").mkdir()
+    elif fault == "worktree-layer":
+        (request.workspace_path / ".codex").symlink_to("missing")
+    else:
+        journal.update(request={"target_execution_id": str(uuid4())})
+    try:
+        result = policy_execute(runtime, request)
+        assert result.status == "failed"
+    except WorkerError:
+        assert runtime.policy_blocked.is_set()
+    assert not wire_methods(capture, "thread/start")
+
+
+def test_job_cannot_inject_operator_projects(server, sealed_policy, job, tmp_path):
+    policy = sealed_policy
+    runtime, capture = server(root=policy.root, profile=policy.profile, policy=policy)
+    request = policy_request(policy, job)
+    directory = tmp_path / "job-config"
+    directory.mkdir()
+    with FileLock(policy.root / "locks" / ("execution-" + request.execution_id + ".lock")) as lock:
+        SharedCodexAdapter(policy.root).argv(replace(request, lock_fd=lock.fd), directory)
+        frame = json.loads((directory / "shared-job.json").read_text())
+        frame["start"]["config"]["projects"] = policy.projects
+        result = bridge(frame, "synthetic", lock.fd, request.journal_path, Event())
+    assert result != 0
+    assert Journal(job_path(policy.root, request.execution_id)).read()["code"] == "PERMISSION_DENIED"
+    assert not wire_methods(capture, "thread/start")
+
+
+@pytest.mark.parametrize("point", ["before-start", "after-thread", "after-turn", "before-success", "git-marker"])
+def test_drift_windows_fence_native_turn_or_success(server, sealed_policy, job, monkeypatch, point):
+    policy = sealed_policy
+    runtime, capture = server(root=policy.root, profile=policy.profile, policy=policy)
+    request = policy_request(policy, job)
+    path = policy.profile / "config.toml"
+    def mutate():
+        if point == "git-marker":
+            (request.workspace_path / ".git").write_text("gitdir: /unapproved-root/.git\n")
+            return
+        path.write_text('model = "SYNTHETIC_POLICY_SECRET"')
+        path.chmod(0o600)
+    original = runtime.rpc.call
+    def call(method, params, **kwargs):
+        value = original(method, params, **kwargs)
+        if method == {"after-thread": "thread/start", "git-marker": "thread/start", "after-turn": "turn/start", "before-success": "thread/unsubscribe"}.get(point):
+            mutate()
+        return value
+    monkeypatch.setattr(runtime.rpc, "call", call)
+    if point == "before-start":
+        mutate()
+    try:
+        result = policy_execute(runtime, request)
+        assert result.status == "failed" and result.error_code == "PERMISSION_DENIED"
+    except WorkerError:
+        assert point == "before-start"
+    assert runtime.policy_blocked.is_set()
+    assert runtime.state.read()["policy_blocked"] is True
+    assert SharedCodexAdapter(policy.root).probe()["health"] == "blocked"
+    assert len(wire_methods(capture, "turn/start")) == (0 if point in {"before-start", "after-thread", "git-marker"} else 1)
+    if point != "before-start":
+        assert Journal(job_path(policy.root, request.execution_id)).read()["proof"] == "thread_closed"
+    if point != "before-start":
+        with pytest.raises(WorkerError):
+            check_receipt(policy.root, Journal(request.journal_path).read())
+    else:
+        assert Journal(request.journal_path).read().get("shared_profile_policy") is None
+    assert "SYNTHETIC_POLICY_SECRET" not in json.dumps(runtime.state.read())
+
+
+@pytest.mark.parametrize("mode,mutation", [("slow", "manifest"), ("slow", "loop"), ("slow", "deep"), ("slow-no-close", "manifest")])
+def test_drift_interrupts_all_siblings_and_keeps_unproved_locks(server, sealed_policy, job, mode, mutation):
+    policy = sealed_policy
+    runtime, capture = server(mode, root=policy.root, profile=policy.profile, policy=policy)
+    jobs = [policy_request(policy, job, number) for number in range(3)]
+    results, errors = {}, []
+    def execute(number):
+        try:
+            results[number] = policy_execute(runtime, jobs[number])
+        except Exception as exc:
+            errors.append(exc)
+    runners = [threading.Thread(target=execute, args=(number,)) for number in range(3)]
+    for runner in runners:
+        runner.start()
+    until = time.monotonic() + 8
+    while time.monotonic() < until:
+        if all(Journal(job_path(policy.root, request.execution_id)).read().get("status") == "running" for request in jobs):
+            break
+        time.sleep(0.01)
+    assert len(wire_methods(capture, "turn/start")) == 3
+    if mutation == "manifest":
+        policy.manifest.write_text('{"version":1,"project_roots":[]}')
+    elif mutation == "loop":
+        (policy.profile / "config.toml").symlink_to("config.toml")
+    else:
+        path = policy.profile / "config.toml"
+        path.write_text('x=' + '{a=' * 2000 + '1' + '}' * 2000)
+        path.chmod(0o600)
+    for runner in runners:
+        runner.join(timeout=12)
+        assert not runner.is_alive()
+    assert not errors, errors
+    assert len(wire_methods(capture, "turn/interrupt")) == 3
+    expected = "failed" if mode == "slow" else "uncertain"
+    assert [results[n].status for n in range(3)] == [expected] * 3
+    assert runtime.policy_blocked.is_set()
+    for request in jobs:
+        lock = FileLock(policy.root / "locks" / ("execution-" + request.execution_id + ".lock"))
+        if mode == "slow":
+            with lock:
+                pass
+        else:
+            with pytest.raises(WorkerError):
+                with lock:
+                    pass
+            assert not results[jobs.index(request)].process_stopped
+    old = Journal(job_path(policy.root, jobs[0].execution_id)).read()
+    runtime.stopping.set()
+    until = time.monotonic() + 6
+    while runtime.state.read().get("stopped") is not True and time.monotonic() < until:
+        time.sleep(0.05)
+    assert runtime.state.read()["stopped"] is True
+    policy.manifest.write_text(json.dumps({"version": 1, "project_roots": [str(policy.repositories[0])]}))
+    if mutation in {"loop", "deep"}:
+        (policy.profile / "config.toml").unlink()
+    replacement_policy = SealedProfilePolicy(policy.root, policy.profile, policy.manifest)
+    replacement, new_capture = server(root=policy.root, profile=policy.profile, policy=replacement_policy)
+    with FileLock(policy.root / "locks" / ("execution-" + jobs[0].execution_id + ".lock")) as lock:
+        with pytest.raises(WorkerError):
+            bridge({"root": str(policy.root), "execution_id": jobs[0].execution_id, "start": {}, "timeout": 1},
+                   "never replay", lock.fd, jobs[0].journal_path, Event())
+    assert Journal(job_path(policy.root, jobs[0].execution_id)).read()["generation"] == old["generation"]
+    assert not wire_methods(new_capture, "thread/start")
+    with pytest.raises(WorkerError):
+        check_receipt(policy.root, Journal(jobs[0].journal_path).read())
+    fresh = policy_request(replacement_policy, job, 4)
+    assert policy_execute(replacement, fresh).status == "succeeded"
+
+
+def test_delayed_start_does_not_delay_drift_interrupt_of_running_sibling(server, sealed_policy, job, monkeypatch):
+    policy = sealed_policy
+    runtime, capture = server("slow", root=policy.root, profile=policy.profile, policy=policy)
+    first, second = policy_request(policy, job, 0), policy_request(policy, job, 1)
+    blocked, release = Event(), Event()
+    original = runtime.rpc.call
+    def call(method, params, **kwargs):
+        if method == "thread/start" and params.get("model") == "model-1":
+            blocked.set()
+            assert release.wait(timeout=4)
+        return original(method, params, **kwargs)
+    monkeypatch.setattr(runtime.rpc, "call", call)
+    results = {}
+    first_runner = threading.Thread(target=lambda: results.update(first=policy_execute(runtime, first)))
+    second_runner = threading.Thread(target=lambda: results.update(second=policy_execute(runtime, second)))
+    first_runner.start()
+    until = time.monotonic() + 5
+    while Journal(job_path(policy.root, first.execution_id)).read().get("status") != "running" and time.monotonic() < until:
+        time.sleep(0.01)
+    second_runner.start()
+    assert blocked.wait(timeout=5)
+    try:
+        policy.manifest.write_text('{"version":1,"project_roots":[]}')
+        until = time.monotonic() + 1.5
+        while not wire_methods(capture, "turn/interrupt") and time.monotonic() < until:
+            time.sleep(0.01)
+        assert runtime.policy_blocked.is_set()
+        assert len(wire_methods(capture, "turn/interrupt")) == 1
+        assert not release.is_set()
+    finally:
+        release.set()
+        first_runner.join(timeout=10)
+        second_runner.join(timeout=10)
+    assert not first_runner.is_alive() and not second_runner.is_alive()
+    assert results["first"].status == results["second"].status == "failed"
+    assert len(wire_methods(capture, "turn/start")) == 1
 
 
 def test_three_jobs_share_one_server_and_cancel_only_one(server, tmp_path):
