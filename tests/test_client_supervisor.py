@@ -78,6 +78,24 @@ def test_result_transport_failure_never_claims_persistence(repository, job):
     assert journal.read()["phase"] == "result_intent"
     assert journal.read()["terminal_result"]["status"] == "succeeded"
 
+def test_terminal_cancellation_cannot_hide_unresolved_patch(repository, job, monkeypatch):
+    executor = Executor(repository[0], require_ext4=False)
+    workspace = executor.workspaces.allocate(job)
+    workspace.journal.update(patch_intents={"development": {"sequence": 1, "files": [
+        {"path": "feature.py", "aux": ".adf-patch-preserved", "pre": None, "post": None, "phase": "prepared"}]}})
+    (workspace.path / ".adf-patch-preserved").write_text("owned incomplete mutation\n")
+    monkeypatch.setattr(executor, "run", lambda *args, **kwargs: {"status": "cancelled", "process_stopped": True})
+    ledger = FakeLedger()
+    supervisor = ExecutionSupervisor(ledger, executor, workspace.journal)
+    supervisor.cancellation.set()
+    claim = {"execution_id": job["execution_id"], "epoch": 1, "request": job,
+             "lease_expires_at": (datetime.now(timezone.utc) + timedelta(seconds=45)).isoformat()}
+    result = supervisor.run(claim)
+    assert result["status"] == "uncertain" and result["error_code"] == "EXECUTION_UNCERTAIN"
+    assert result["patch_mutations_resolved"] is False
+    assert ledger.results == [result]
+    assert workspace.journal.read()["terminal_persisted"] is False
+
 def test_reconcile_refuses_a_live_supervisor(repository, job):
     import os
     executor = Executor(repository[0], require_ext4=False)

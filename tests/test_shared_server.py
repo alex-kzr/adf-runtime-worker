@@ -31,6 +31,13 @@ def server(tmp_path):
     running = []
     def start(mode="ready", root=None, environment=None, profile=None, policy=None):
         root = root or tmp_path / ("root-" + str(len(running)))
+        # The durable stopped receipt precedes socket unlink. Join the owned
+        # offline thread before replacement so a stale socket is not readiness.
+        for previous, previous_owner, _ in running:
+            if previous.root == root:
+                assert previous.state.read().get("stopped") is True
+                previous_owner.join(timeout=6)
+                assert not previous_owner.is_alive()
         root.mkdir(exist_ok=True)
         root.chmod(0o700)
         capture = tmp_path / ("wire-" + str(len(running)) + ".jsonl")
@@ -564,7 +571,7 @@ def test_shared_nonbaseline_environment_is_refused_before_probe_or_dispatch(tmp_
 def test_actual_orchestrator_baseline_uses_fixed_operator_environment(server, tmp_path, monkeypatch):
     from adf_runtime_worker.adapters import CodexAdapter
     from adf_runtime_worker.profiles import ProviderProfile
-    fixture = json.loads((FAKE.parent / "orchestrator-6fe7c14-shared-envelope.json").read_text())
+    fixture = json.loads((FAKE.parent / "orchestrator-shared-envelope.json").read_text())
     names = tuple(fixture["request"]["env_allowlist"])
     home = tmp_path / "adf-worker"
     profile = home / "ai-factory/provider-profiles/codex"

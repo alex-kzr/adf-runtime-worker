@@ -15,19 +15,21 @@ from .capabilities import scoped_mcp, skill_snapshot
 from .git_workspace import GitWorkspaceManager, Workspace
 from .models import Adapter, EventSink, Json, Request, WorkerError
 from .process import ProcessRunner, disk_bytes
-from .security import Redactor, validate_relative, within_root
+from .security import Redactor, digest, validate_relative, within_root
 
 _PLAN_SCHEMA: Json = {"type": "object", "additionalProperties": False, "properties": {"tasks": {"type": "array", "minItems": 1, "maxItems": 12, "items": {"type": "object", "additionalProperties": False, "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "description": {"type": "string"}, "acceptance_criteria": {"type": "array", "items": {"type": "string"}}, "expected_files": {"type": "array", "items": {"type": "string"}}, "dependency_ids": {"type": "array", "items": {"type": "string"}}}, "required": ["id", "title", "description", "acceptance_criteria", "expected_files", "dependency_ids"]}}, "unknowns": {"type": "array", "items": {"type": "string"}}}, "required": ["tasks", "unknowns"]}
 _REVIEW_SCHEMA: Json = {"type": "object", "additionalProperties": False, "properties": {"approved": {"type": "boolean"}, "findings": {"type": "array", "items": {"type": "string"}}}, "required": ["approved", "findings"]}
 
 class Executor:
-    def __init__(self, root: Path, *, require_ext4: bool = True, provider_paths: dict[str, str] | None = None, provider_profiles: dict[str, str] | None = None, codex_backend: str = "subprocess") -> None:
+    def __init__(self, root: Path, *, require_ext4: bool = True, provider_paths: dict[str, str] | None = None, provider_profiles: dict[str, str] | None = None, codex_backend: str = "subprocess", check_sandbox: Json | None = None) -> None:
         self.workspaces = GitWorkspaceManager(root, require_ext4=require_ext4)
         self.provider_paths = provider_paths or {}
         self.provider_profiles = provider_profiles or {}
-        if codex_backend not in {"subprocess", "shared"}:
+        if codex_backend not in {"subprocess", "shared", "shared-patch"}:
             raise WorkerError("CAPABILITY_UNSUPPORTED", "Unknown Codex backend")
         self.codex_backend = codex_backend
+        from .check_sandbox import CheckSandbox
+        self.check_sandbox = CheckSandbox(check_sandbox)
         self.execution_deadline = float("inf")
         self.secret_values: tuple[str, ...] = ()
 
@@ -132,13 +134,62 @@ class Executor:
             saved = workspace.journal.read()
             if saved.get("run_id") != job["run_id"] or saved.get("project_id") != job["project_id"]:
                 raise WorkerError("PERMISSION_DENIED", "Target allocation belongs to another run/project")
+            if saved.get("patch_intents"):
+                from .patches import mutation_resolved
+                if not mutation_resolved(workspace.journal, workspace.path):
+                    raise WorkerError("EXECUTION_UNCERTAIN", "Unresolved patch intent fences all later operations")
             request = self._request(job, workspace, lock.fd, lease_deadline)
             allowed_paths = job.get("allowed_write_paths", job.get("expected_files", policy.get("allowed_write_paths", [])))
+            patch_job = self.codex_backend == "shared-patch" and job.get("agent", {}).get("provider") == "codex" and operation == "agent_task"
+            if patch_job:
+                if request.permission_profile != "trusted-development" or lease_deadline is None or lock.fd is None:
+                    raise WorkerError("PERMISSION_DENIED", "Shared-patch requires the original approved developer lease/lock")
+                if not allowed_paths or any(not isinstance(name, str) for name in allowed_paths):
+                    raise WorkerError("PERMISSION_DENIED", "Shared-patch requires an immutable original write scope")
+                # Validate checker capability before spending any model turn.
+                self.check_sandbox.launcher()
+                self.check_sandbox.command(Path(sys.executable), ["-I", "-c", "pass"], workspace.path, request)
+                registry = job["project"].get("check_registry", job["project"].get("checks", {}))
+                if isinstance(registry, list):
+                    registry = {entry["id"]: entry for entry in registry}
+                # API snapshots use [] for developer check_ids. Such an empty
+                # list must still validate the checks used by the later loop.
+                for check_id in job.get("check_ids") or list(registry):
+                    if check_id not in registry:
+                        raise WorkerError("PERMISSION_DENIED", "Patch job references an unregistered check")
+                    config = registry[check_id]
+                    argv = config.get("argv", []) if isinstance(config, dict) else config
+                    if not argv or any(not isinstance(arg, str) for arg in argv):
+                        raise WorkerError("INVALID_REQUEST", "Patch checks need registered argv arrays")
+                    executable = sys.executable if argv[0] in {"python", "python3"} else shutil.which(argv[0])
+                    if executable is None:
+                        raise WorkerError("CHECK_UNAVAILABLE", "Patch check executable is unavailable")
+                    self.check_sandbox.command(Path(executable), argv[1:], workspace.path, request)
+                def preflight_output(*_: str) -> None:
+                    pass
+                if self.workspaces.control_guard is None:
+                    raise WorkerError("PERMISSION_DENIED", "Patch preflight needs a live control guard")
+                preflight = self.check_sandbox.run(Path(sys.executable), ["-I", "-c", "pass"], [], request, preflight_output,
+                                                  cancellation, self.workspaces.control_guard)
+                if preflight.status != "succeeded":
+                    raise WorkerError("CAPABILITY_UNSUPPORTED", "Checker namespace/resource preflight failed before generation")
             if operation == "agent_task" and job.get("repair_source_execution_id"):
-                self._repair_snapshot(job, workspace, allowed_paths)
+                self._repair_snapshot(job, workspace, allowed_paths, request=request if patch_job else None)
                 if job.get("agent", {}).get("provider") != "mock":
                     request = replace(request, task_prompt=request.task_prompt + "\nRepair feedback: " + Redactor().text(str(job.get("repair_feedback", "")))[:8192])
             before_head = self.workspaces.git(workspace.path, "rev-parse", "HEAD")
+            patch_baseline: Json = {}
+            if patch_job:
+                from .patches import PATCH_SCHEMA, baseline
+                names = self.workspaces.git(workspace.path, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\x00")
+                patch_baseline = baseline(workspace.path, names, allowed_paths)
+                request = replace(request, structured_schema=PATCH_SCHEMA, task_prompt=request.task_prompt +
+                                  "\nReturn only a bounded adf.text-patch.v1 JSON result. Do not write files or run project code. "
+                                  "Use these worker-supplied preimage hashes; null means absent/create. Existing parents only. "
+                                  "Unsupported binary, rename, mode, commands and metadata edits must be omitted.\nBaseline: " + json.dumps(patch_baseline) +
+                                  "\nSchema: " + json.dumps(PATCH_SCHEMA))
+                workspace.journal.update(patch_generation_intent={"execution_id": request.execution_id, "epoch": request.lease_epoch,
+                                                                 "baseline": patch_baseline, "scope_sha256": digest(allowed_paths)})
             evidence: Json = {"branch": workspace.branch, "base_sha": workspace.base_sha, "root_base_sha": workspace.root_base_sha, "worktree_key": target_id, "workspace_path": str(workspace.path), "process_stopped": True}
             if cancellation.is_set():
                 return {**evidence, "status": "cancelled", "error_code": "CANCEL_REQUESTED"}
@@ -160,7 +211,10 @@ class Executor:
                 provider = job.get("agent", {}).get("provider", "mock")
                 profile = self.provider_profiles.get(provider)
                 adapter: Adapter
-                if provider == "codex" and self.codex_backend == "shared":
+                if patch_job:
+                    from .shared_patch_adapter import SharedPatchAdapter
+                    adapter = SharedPatchAdapter(self.workspaces.root)
+                elif provider == "codex" and self.codex_backend in {"shared", "shared-patch"}:
                     from .shared_adapter import SharedCodexAdapter
                     adapter = SharedCodexAdapter(self.workspaces.root)
                 else:
@@ -175,6 +229,15 @@ class Executor:
                 if guard:
                     guard()
                 if operation == "agent_task":
+                    if patch_job:
+                        from .journal import owned_sessions_stopped
+                        from .patches import parse_patch
+                        if not outcome.process_stopped or not owned_sessions_stopped(workspace.journal.read()):
+                            raise WorkerError("EXECUTION_UNCERTAIN", "Native generation has not quiesced before writing")
+                        patch = parse_patch(outcome.output, allowed_paths, patch_baseline, self.secret_values)
+                        workspace.journal.update(phase="patch_generated", patch_generation={"complete": True, "native_permission": "observe"})
+                        writer = self._patch_writer(job, workspace, request, patch_baseline, allowed_paths)
+                        evidence.update(writer.apply(patch))
                     evidence.update(self.workspaces.changes(workspace, allowed_paths))
                     workspace.journal.update(development_result=evidence)
                 else:
@@ -204,7 +267,8 @@ class Executor:
                 after = self.workspaces.changes(workspace, allowed_paths)
                 if after["tree_sha"] != changes["tree_sha"]:
                     raise WorkerError("TEST_TREE_CHANGED", "Check changed the reviewed tree")
-                evidence.update(after, test_results=checks, status="succeeded" if checks and all(check["status"] == "passed" for check in checks) else "failed")
+                passed = bool(checks) and all(check["status"] == "passed" for check in checks)
+                evidence.update(after, test_results=checks, status="succeeded" if passed else "failed", error_code=None if passed else "TEST_FAILED")
                 workspace.journal.update(test_results=checks)
             elif operation == "git_commit":
                 # Trusted journal evidence wins over a caller-supplied review/test claim.
@@ -229,7 +293,21 @@ class Executor:
                 raise WorkerError("DISK_QUOTA_EXCEEDED", "Run worktree disk quota exceeded")
             return cast(Json, Redactor(self.secret_values).data(evidence))
 
-    def _repair_snapshot(self, job: Json, workspace: Workspace, allowed_paths: list[str]) -> None:
+    def _patch_writer(self, job: Json, workspace: Workspace, request: Request, expected: Json, scopes: list[str]) -> Any:
+        from .patches import PatchWriter
+        if request.lease_deadline is None or request.lock_fd is None or self.workspaces.control_guard is None:
+            raise WorkerError("PERMISSION_DENIED", "Patch writer cannot run without live supervisor lease")
+        dispatch = self.workspaces.journal_for(request.execution_id).read()
+        if dispatch.get("epoch", request.lease_epoch) != request.lease_epoch:
+            raise WorkerError("LEASE_STALE", "Patch lease epoch differs from durable dispatch")
+        binding = {"execution_id": request.execution_id, "run_id": job["run_id"], "project_id": job["project_id"],
+                   "epoch": request.lease_epoch, "approved": job["policy"].get("approved") is True,
+                   "role": request.permission_profile, "scopes": list(scopes), "policy_sha256": digest(job["policy"]),
+                   "baseline": expected, "lock_path": str(self.workspaces.root / "locks" / ("execution-" + workspace.execution_id + ".lock"))}
+        return PatchWriter(workspace.path, workspace.journal, self.workspaces.control_guard, lock_fd=request.lock_fd,
+                           binding=binding, secrets=self.secret_values)
+
+    def _repair_snapshot(self, job: Json, workspace: Workspace, allowed_paths: list[str], *, request: Request | None = None) -> None:
         from .journal import owned_sessions_stopped
         source_id = str(job["repair_source_execution_id"])
         if source_id == workspace.execution_id:
@@ -244,6 +322,21 @@ class Executor:
             if self.workspaces.git(source.path, "rev-parse", source.base_sha + "^{tree}") != self.workspaces.git(workspace.path, "rev-parse", workspace.base_sha + "^{tree}"):
                 raise WorkerError("VERSION_CONFLICT", "Repair dependency snapshot changed")
             changes = self.workspaces.changes(source, allowed_paths)
+            if request is not None:
+                from .patches import baseline, image, mutation_resolved, parent_fd
+                if not mutation_resolved(source.journal, source.path):
+                    raise WorkerError("EXECUTION_UNCERTAIN", "Repair source has unresolved patch mutations")
+                expected = baseline(workspace.path, changes["changed_paths"], allowed_paths)
+                edits: list[Json] = []
+                for name in changes["changed_paths"]:
+                    with parent_fd(source.path, name) as (fd, leaf):
+                        original, raw = image(fd, leaf)
+                    pre = expected.get(name)
+                    edits.append({"path": name, "action": "delete" if original is None else "replace" if pre else "create",
+                                  "preimage": pre, "content": raw.decode("utf-8") if raw is not None else None})
+                self._patch_writer(job, workspace, request, expected, allowed_paths).apply({"version": 1, "edits": edits}, key="repair")
+                workspace.journal.update(repair_source_execution_id=source_id, repair_source_tree_sha=changes["tree_sha"])
+                return
             for name in changes["changed_paths"]:
                 original = source.path / name
                 destination = workspace.path / name
@@ -280,7 +373,15 @@ class Executor:
             check_request = replace(request, timeout_sec=min(remaining, int(timeout)))
             def output(stream: str, text: str, check_name: str = check_id) -> None:
                 sink("output", {"check_id": check_name, "stream": stream, "text": text[:4096]})
-            outcome = ProcessRunner().run([executable, *argv[1:]], check_request, output, cancellation)
+            if self.codex_backend == "shared-patch":
+                if self.workspaces.control_guard is None:
+                    raise WorkerError("PERMISSION_DENIED", "Isolated checks need original lease/policy guard")
+                self.workspaces.control_guard()
+                names = self.workspaces.git(workspace.path, "ls-files", "--cached", "-z").split("\x00")
+                outcome = self.check_sandbox.run(Path(executable), argv[1:], [name for name in names if name], check_request,
+                                                 output, cancellation, self.workspaces.control_guard)
+            else:
+                outcome = ProcessRunner().run([executable, *argv[1:]], check_request, output, cancellation)
             results.append({"check_id": check_id, "status": "passed" if outcome.status == "succeeded" else "cancelled" if outcome.status == "cancelled" else "failed", "exit_code": outcome.exit_code, "tree_sha": tree, "error_code": outcome.error_code})
             if outcome.status != "succeeded":
                 break

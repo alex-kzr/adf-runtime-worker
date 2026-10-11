@@ -104,6 +104,11 @@ def inspect_content(path: Path, limit: int = 2 * 1024 * 1024, *, secret_values: 
     if path.stat().st_size > limit:
         raise WorkerError("QUOTA_EXCEEDED", "Changed file exceeds scan limit")
     raw = path.read_bytes()
+    inspect_bytes(raw, secret_values=secret_values)
+
+
+def inspect_bytes(raw: bytes, *, secret_values: tuple[str, ...] = ()) -> None:
+    """Scan already fd-verified content without reopening a mutable path."""
     if b"\x00" in raw:
         raise WorkerError("PERMISSION_DENIED", "Binary changes require explicit future scan policy")
     text = raw.decode("utf-8", errors="replace")

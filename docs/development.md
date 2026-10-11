@@ -1,5 +1,19 @@
 # Host runtime development
 
+## Opt-in shared-patch source backend
+
+`--codex-backend shared-patch --check-sandbox-manifest <private-file>` selects structured generation plus host application. The immutable ticket carries the operator configuration; the model cannot select backend, manifest, commands or permissions. The checker manifest is a canonical owned 0600 file with exactly `version`, `bwrap`, `sha256`, `toolchain_roots`; it is separate from the unchanged sealed provider policy. Existing scoped MCP v1 remains read-only.
+
+The adapter keeps the original approved developer scope/budget but dispatches `observe` natively. A stopped generated result is intermediate `patch_generated`, not terminal success. The writer validates the closed text schema, trusted baseline, no-follow directory FDs, single-link files, lease/epoch/policy/allocation lock and secrets before bounded mutations. Durable ordered intents preserve ambiguous preimages. Fresh repair transfer uses the same writer; recovery classifies without model or mutation replay, and uncertain intents prohibit ACK/later operations.
+
+Only pinned worker Python checks are supported. An empty namespace mounts verified staged files/toolchains read-only, clears the environment, isolates PID/IPC/network, bounds private HOME/scratch and remounts root/dev read-only. A trusted bootstrap hard-caps AS=128 MiB, NOFILE=64, CORE=0, MEMLOCK=0, CPU/file sizes. Its read-only namespace entry closes all helper FDs and applies Linux x86-64 seccomp before project code. Fork/clone/threads, io_uring/AIO, keyrings, anonymous shmem/IPC/MQ, sockets and selected kernel/namespace/cross-process interfaces are denied. Host UID/global limits and security settings are untouched. No-project-code preflight validates the actual capability and all selected commands before generation; setup failure never executes checks on the host.
+
+Snapshots exclude metadata/credentials/ignored files and project `.venv`/`node_modules`; limits are 4,096 files, 2 MiB/file and 64 MiB aggregate, further restricted by the original disk budget. Existing parents/text/modes only for writes. Node/V8, threaded/subprocess/network/generic builds, aggregate cgroups and native secret-read isolation remain explicit deployment/MVP gaps. This is a closed trusted-repository checker, not a general hostile-code sandbox.
+
+CI sets `ADF_TEST_BWRAP_PATH` to the standalone official Codex 0.157.0 launcher after exact SHA-256 verification (`77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c`). It never executes a coding CLI or model. Local runs without that fixture skip two namespace regressions; release QA/CI must provide it. The real Git regression runs three concurrent fake generations, deterministic failed check, fresh repair/retest, independent review, commits and sequential integration while preserving main.
+
+See [source contract/phases](../../../docs/shared-patch-source.md), [ADR 008 and official sources](../../../docs/adr/008-shared-patch-and-isolated-checks.md) and [separate installation/acceptance scope](../../../docs/shared-patch-deployment.md).
+
 ## Boundaries
 
 `models.py` contains immutable adapter requests/results and the structural `Adapter` protocol. `adapters.py` maps pinned provider JSONL fixtures to bounded normalized events. `process.py` owns argv-based processes, pipes, deadlines and group termination. `security.py` owns canonical roots, restricted environment and pre-storage redaction. `journal.py` owns fsynced atomic intents and OS locks. `git_workspace.py` owns allocation, exact-tree staging/commits and serial delta integration. `executor.py` exposes only registered runtime phases. `client.py` is the scoped API facade. `supervisor.py` owns one execution independently of the transport consumer. `service.py` consumes Redis and acknowledges only persisted terminal/no-op delivery. `telemetry.py` exports opt-in metadata-only OTel.

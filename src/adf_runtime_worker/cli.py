@@ -75,7 +75,8 @@ def main() -> None:
     serve.add_argument("--claude", default=os.getenv("ADF_CLAUDE_PATH"))
     serve.add_argument("--codex-home", type=Path, help="Existing private persistent Codex profile; no login or credential copy")
     serve.add_argument("--claude-config-dir", type=Path, help="Existing private persistent Claude profile; no token generation")
-    serve.add_argument("--codex-backend", choices=("subprocess", "shared"), default="subprocess")
+    serve.add_argument("--codex-backend", choices=("subprocess", "shared", "shared-patch"), default="subprocess")
+    serve.add_argument("--check-sandbox-manifest", type=Path, help="Separate private operator-pinned bubblewrap/toolchain manifest for shared-patch checks")
     serve.add_argument("--recovery-only", action="store_true", help="Reconcile existing owned executions only; no provider probes, new lease claims or supervisor starts")
     server = sub.add_parser("provider-server", help="Run one persistent pinned Codex app-server; no login")
     server.add_argument("--root", type=Path, required=True)
@@ -116,7 +117,12 @@ def main() -> None:
         elif args.command == "serve":
             if not args.token_file or not args.redis_password_file:
                 raise WorkerError("AUTH_REQUIRED", "Separate worker token and Redis password files are required")
-            WorkerService(args.root, args.api_url, args.token_file, args.redis_url, args.redis_password_file, max_parallel=args.max_parallel, provider_paths={key: value for key, value in {"codex": args.codex, "claude": args.claude}.items() if value}, provider_profiles={key: str(value) for key, value in {"codex": args.codex_home, "claude": args.claude_config_dir}.items() if value}, codex_backend=args.codex_backend, project_roots=args.project_root, recovery_only=args.recovery_only).run()
+            checker = None
+            if args.check_sandbox_manifest:
+                from .profile_policy import private_bytes
+                raw, _ = private_bytes(args.check_sandbox_manifest, limit=65536)
+                checker = json.loads(raw)
+            WorkerService(args.root, args.api_url, args.token_file, args.redis_url, args.redis_password_file, max_parallel=args.max_parallel, provider_paths={key: value for key, value in {"codex": args.codex, "claude": args.claude}.items() if value}, provider_profiles={key: str(value) for key, value in {"codex": args.codex_home, "claude": args.claude_config_dir}.items() if value}, codex_backend=args.codex_backend, project_roots=args.project_root, recovery_only=args.recovery_only, check_sandbox=checker).run()
         else:
             body = json.loads(args.request.read_text(encoding="utf-8"))
             sequence = 0

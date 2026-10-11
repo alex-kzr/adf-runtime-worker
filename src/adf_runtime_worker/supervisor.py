@@ -142,6 +142,8 @@ class ExecutionSupervisor:
                     result.update(status="failed", error_code=exc.code)
             if not owned_sessions_stopped(self.journal.read()):
                 result.update(status="uncertain", process_stopped=False, error_code="EXECUTION_UNCERTAIN")
+            if not patch_proof(self.journal, self.executor, str(job.get("target_execution_id") or execution_id)):
+                result.update(status="uncertain", error_code="EXECUTION_UNCERTAIN", patch_mutations_resolved=False)
             self.journal.update(terminal_result=result, phase="result_intent")
             try:
                 response = self.ledger.result(execution_id, epoch, result["status"], result)
@@ -170,12 +172,30 @@ class ExecutionSupervisor:
                     self.executor.workspaces.worktree_lock_fd = None
         return artifacts
 
+def patch_proof(journal: Journal, executor: Executor, target: str) -> bool:
+    from .patches import mutation_resolved
+    from .security import within_root
+    for current in (journal, executor.workspaces.journal_for(target)):
+        saved = current.read()
+        if not saved.get("patch_intents"):
+            continue
+        try:
+            workspace = within_root(Path(saved["workspace"]["path"]), executor.workspaces.root)
+        except (WorkerError, KeyError, OSError):
+            return False
+        if not mutation_resolved(current, workspace):
+            return False
+    return True
+
+
 def stopped_proof(journal: Journal, executor: Executor) -> Json:
     saved = journal.read()
     if not process_stopped(saved.get("supervisor", {})) or not owned_sessions_stopped(saved):
         raise WorkerError("EXECUTION_UNCERTAIN", "Supervisor or owned CLI/Git session still alive")
     target = str(saved.get("request", {}).get("target_execution_id") or saved["execution_id"])
     with executor.workspaces.worktree_lock(target):
+        if not patch_proof(journal, executor, target):
+            raise WorkerError("EXECUTION_UNCERTAIN", "Unresolved patch intent prevents terminal reconciliation/ACK")
         identity = saved.get("supervisor", {})
         return {"journal_id": journal.path.name, "pid": identity.get("pid"), "start_ticks": identity.get("start_ticks"), "pgid": identity.get("pgid"), "session_id": identity.get("session_id"), "child_process": saved.get("process", {}), "child_group_stopped": True, "worktree_lock_reacquired": True, "terminal_evidence": saved.get("terminal_result", {})}
 
@@ -183,7 +203,7 @@ def supervise_ticket(ticket: Path) -> None:
     saved = Journal(ticket).read()
     config = saved["worker_config"]
     root = Path(config["root"])
-    executor = Executor(root, provider_paths=config.get("provider_paths", {}), provider_profiles=config.get("provider_profiles", {}), codex_backend=config.get("codex_backend", "subprocess"))
+    executor = Executor(root, provider_paths=config.get("provider_paths", {}), provider_profiles=config.get("provider_profiles", {}), codex_backend=config.get("codex_backend", "subprocess"), check_sandbox=config.get("check_sandbox"))
     journal = Journal(ticket)
     with FileLock(root / "locks" / f"slot-{config['slot']}.lock"):
         with ApiClient(config["api_url"], Path(config["token_file"]), config["worker_id"]) as ledger:

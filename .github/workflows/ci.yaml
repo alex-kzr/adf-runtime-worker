@@ -6,7 +6,7 @@ permissions:
   contents: read
 jobs:
   linux:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -15,6 +15,16 @@ jobs:
           python-version: 3.12.9
       - run: python -m pip install -r requirements-dev.lock
       - run: python -m pip install --no-deps -e .
+      - name: Prepare pinned standalone checker fixture (no provider execution)
+        run: |
+          npm install --prefix "$RUNNER_TEMP/adf-codex-fixture" --ignore-scripts --no-audit --no-fund @openai/codex@0.157.0
+          launcher="$RUNNER_TEMP/adf-codex-fixture/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-resources/bwrap"
+          if ! test -x "$launcher"; then
+            launcher="$RUNNER_TEMP/adf-codex-fixture/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-resources/bwrap"
+          fi
+          test -x "$launcher"
+          echo "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c  $launcher" | sha256sum --check --strict
+          echo "ADF_TEST_BWRAP_PATH=$launcher" >> "$GITHUB_ENV"
       - run: ruff check src tests
       - run: mypy src
       - run: bandit -r src -ll

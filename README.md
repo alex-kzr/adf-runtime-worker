@@ -6,6 +6,8 @@ The runtime is implemented. **Whole MVP readiness still requires the matching um
 
 ## Run in Ubuntu WSL2
 
+Opt-in source backend `shared-patch` uses native read-only structured generation and an original-authorized host writer. A separate private operator checker manifest enables bounded, isolated single-process Python checks; there is no host fallback. The existing test/repair/review/commit/serial integration loop remains mandatory. This source is not installed or natively accepted. Node/build checks and native secret-read isolation remain gates. See [source behavior](../../docs/shared-patch-source.md), [ADR 008](../../docs/adr/008-shared-patch-and-isolated-checks.md), [separate deployment scope](../../docs/shared-patch-deployment.md) and [development](docs/development.md).
+
 Python 3.12.9 and uv 0.12.18 are the verified local tooling. Install the exact dependency lock in a virtual environment; the source checkout may be read from Windows, but target repositories, worktrees and runtime journals must be on Linux ext4.
 
 ```sh
