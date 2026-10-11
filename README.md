@@ -47,6 +47,8 @@ Read [host runtime design and limitations](docs/development.md) and [persistent 
 
 The operator-only [sealed shared-profile policy](docs/shared-profile-policy.md) permits an exact trust-only baseline through `provider-server --shared-profile-policy`. Its owner CLI override avoids the pinned automatic trust write; immutable receipts fence drift and later Git copies/commits. The default continues to reject user configuration. This source feature is not a runtime deployment or a native acceptance result.
 
+**Sealed shared mode currently supports read-only jobs only.** Codex 0.157.0's workspace-write sandbox creates a temporary host `.codex` mount target, incompatible with the strict guard. Writes fail before native thread/turn creation with `CAPABILITY_UNSUPPORTED`; health exposes that boundary without blocking read-only siblings. `serve --recovery-only` reconciles existing locally owned journal intents without provider probes, new leases, queued execution or owner lifecycle changes. See [the source repair and remaining deployment gate](../../docs/shared-sandbox-recovery-repair.md). These source changes do not replace an installed worker or establish MVP acceptance.
+
 ## Shared design
 
 - [Architecture](../../docs/architecture.md)

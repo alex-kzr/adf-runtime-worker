@@ -67,6 +67,14 @@ class SharedCodexAdapter(CodexAdapter):
 
     def execute(self, request: Request, event_sink: EventSink, cancellation: Event) -> AdapterResult:
         request = self._fixed_environment_request(request)
+        if request.permission_profile == "trusted-development":
+            health = self.probe(request.wall_deadline)
+            if health.get("policy") == "blocked":
+                raise WorkerError("PERMISSION_DENIED", "Shared operator policy generation is blocked")
+            if health.get("write_capability", {}).get("supported") is False:
+                # Refuse before session config/skills materialization. The owner
+                # independently validates forged/direct IPC requests as well.
+                raise WorkerError("CAPABILITY_UNSUPPORTED", "Sealed shared policy does not support workspace-write")
         result = super().execute(request, event_sink, cancellation)
         data = Journal(request.journal_path).read() if request.journal_path else {}
         reference = data.get("shared_session")

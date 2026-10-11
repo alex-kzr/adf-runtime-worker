@@ -2,6 +2,14 @@
 
 This is an opt-in source implementation of [umbrella ADR 007](../../../docs/adr/007-sealed-shared-profile-policy.md). Native queued acceptance and MVP readiness remain pending. No ordinary worker startup writes or repairs the provider configuration.
 
+## Supported execution boundary
+
+The pinned Codex 0.157.0 Linux `workspace-write` sandbox creates an empty host `.codex` directory as a temporary protected mount target. This conflicts with the policy's strict absence checks even when no configuration is present. [Pinned source, no-model reproduction and retained runtime provenance](../../../docs/shared-sandbox-recovery-repair.md) establish this mechanism. The guard, its polling monitor and receipt fencing remain unchanged.
+
+With this policy, only `observe` / `read_only` are supported. The adapter rejects `trusted-development` before session/skill materialization. The owner independently rejects a direct `workspace-write` IPC frame with `CAPABILITY_UNSUPPORTED` before binding or native thread/turn creation, recording a quiesced `no_thread` tombstone. Unsupported writes do not block the generation or read-only siblings. Default unsealed/subprocess behavior is unchanged and does not gain additional verified isolation from this repair.
+
+Health separates authentication (`auth`), policy state (`policy`), supported `permission_profiles` and `write_capability`. A ready transport/auth check is compatible with unsupported writes; `ready_for_real_execution` remains false. This is a truthful capability correction, not completion of autonomous coding or the three-job native acceptance gate. Allowing an empty `.codex`, switching sandbox implementations, disabling monitoring or upgrading the CLI requires separate policy/architecture review and authorization.
+
 ## Operator input
 
 Only `provider-server` accepts `--shared-profile-policy`; jobs, API requests and consumer configuration cannot select or extend it. Omission preserves the default refusal of every `config.toml` and policy layer. Put the manifest below the runtime's `tools` directory, outside repositories/worktrees:
@@ -52,6 +60,8 @@ adf-worker provider-server --root /home/adf-worker/ai-factory \
 ```
 
 The consumer keeps its existing settings and `--codex-backend shared`. Keep a verified immutable previous worker source and dependency inventory before replacing its venv. Invalid existing config stops deployment and is preserved; this scope does not authorize deleting, renaming, merging or overwriting it. Roll back only after writers drain or recorded ownership proves them stopped. A previously rejecting profile stays rejecting under the old release; a stopped, verified old worker is a valid safe rollback state.
+
+For an explicitly authorized terminal reconciliation, start **only the consumer** with the same existing root, worker identity, project/API/Redis settings and `serve --recovery-only --codex-backend shared`. Do not use a startup wrapper that requires ready provider health and then restarts/stops the owner. Recovery-only does not probe either provider, create threads/turns, claim API leases, spawn supervisors, read new Redis entries or reassign pending entries. It scans locally owned epoch journals, replays durable result/events or reconciles with stopped-session and reacquired-lock proof, then ACKs only API-confirmed terminal results using recorded message IDs. Unknown or foreign jobs remain pending. Live writers, unproved shared references and held locks prevent ACK. It does not provision authentication or authorize a runtime installation. Stop this dedicated consumer through its recorded process identity after reconciliation; it does not stop the owner. No credential values belong in command arguments or logs.
 
 ## Verification
 

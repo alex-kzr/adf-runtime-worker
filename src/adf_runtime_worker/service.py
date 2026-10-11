@@ -25,12 +25,13 @@ STREAM = "adf:executions"
 GROUP = "adf-workers"
 
 class WorkerService:
-    def __init__(self, root: Path, api_url: str, token_file: Path, redis_url: str, redis_password_file: Path, *, worker_id: str | None = None, max_parallel: int = 3, provider_paths: dict[str, str] | None = None, provider_profiles: dict[str, str] | None = None, codex_backend: str = "subprocess", project_ids: list[str] | None = None, project_roots: list[Path] | None = None) -> None:
+    def __init__(self, root: Path, api_url: str, token_file: Path, redis_url: str, redis_password_file: Path, *, worker_id: str | None = None, max_parallel: int = 3, provider_paths: dict[str, str] | None = None, provider_profiles: dict[str, str] | None = None, codex_backend: str = "subprocess", project_ids: list[str] | None = None, project_roots: list[Path] | None = None, recovery_only: bool = False) -> None:
         self.root = canonical_root(root)
         self.executor = Executor(self.root, provider_paths=provider_paths, provider_profiles=provider_profiles, codex_backend=codex_backend)
         if max_parallel < 1 or max_parallel > 3:
             raise WorkerError("QUOTA_EXCEEDED", "Worker concurrency must be between one and three")
         self.max_parallel = max_parallel
+        self.recovery_only = recovery_only
         self.project_roots = [canonical_root(path) for path in (project_roots or [self.root / "projects"])]
         if any(not path.is_relative_to(self.root) or path == self.root for path in self.project_roots):
             raise WorkerError("INVALID_PATH", "Registered project roots must be inside runtime root")
@@ -39,6 +40,8 @@ class WorkerService:
         identity_file = config_dir / "worker-id.json"
         if worker_id is None:
             if not identity_file.exists():
+                if recovery_only:
+                    raise WorkerError("EXECUTION_UNCERTAIN", "Recovery requires the existing worker identity")
                 Journal(identity_file).update(worker_id=str(uuid4()))
             worker_id = str(Journal(identity_file).read()["worker_id"])
         UUID(worker_id)
@@ -113,6 +116,14 @@ class WorkerService:
         if any(item.read().get("execution_id") == execution_id for item in self._active()):
             return
         local = self.executor.workspaces.journal_for(execution_id).read()
+        if self.recovery_only:
+            if not local.get("epoch") or local.get("worker_config", {}).get("worker_id") != self.worker_id:
+                return  # Unknown deliveries stay pending; never claim or spawn.
+            self._reconcile(execution_id)
+            reconciled = self.executor.workspaces.journal_for(execution_id).read()
+            if reconciled.get("terminal_persisted") and reconciled.get("result_persisted"):
+                self.redis.xack(STREAM, GROUP, message_id)
+            return
         if local.get("epoch") and local.get("worker_config", {}).get("worker_id") == self.worker_id:
             # A consumed execution is never relaunched: replay durable intent or prove death.
             self._reconcile(execution_id)
@@ -149,12 +160,32 @@ class WorkerService:
             if saved.get("worker_config", {}).get("worker_id") != self.worker_id:
                 continue
             if saved.get("terminal_persisted") and saved.get("result_persisted") and saved.get("redis_message_id") and not saved.get("redis_acked"):
+                if self.recovery_only:
+                    if not saved.get("epoch"):
+                        continue
+                    try:
+                        stopped_proof(Journal(path), self.executor)
+                    except WorkerError:
+                        continue
                 self.redis.xack(STREAM, GROUP, saved["redis_message_id"])
                 Journal(path).update(redis_acked=True)
         for execution_id, child in list(self.children.items()):
             if child.poll() is not None:
                 child.wait()
                 del self.children[execution_id]
+
+    def _recover_local(self) -> None:
+        # Recovery does not depend on provider health, generation replacement,
+        # authentication probes or any new API lease claim.
+        for path in (self.root / "journals").glob("*.json"):
+            saved = Journal(path).read()
+            if (not saved.get("epoch") or saved.get("worker_config", {}).get("worker_id") != self.worker_id
+                    or saved.get("terminal_persisted") and saved.get("result_persisted")):
+                continue
+            try:
+                self._reconcile(str(saved["execution_id"]))
+            except WorkerError:
+                continue  # Live/uncertain writers remain pending, without ACK.
 
     def run(self) -> None:
         with FileLock(self.root / "locks" / "consumer.lock"):
@@ -165,12 +196,14 @@ class WorkerService:
                 except redis.ResponseError as exc:
                     if "BUSYGROUP" not in str(exc):
                         raise
-                names = ("claude", "mock") if self.config["codex_backend"] == "shared" else ("codex", "claude", "mock")
+                names = () if self.recovery_only else ("claude", "mock") if self.config["codex_backend"] == "shared" else ("codex", "claude", "mock")
                 providers = {name: provider_adapter(name, self.config["provider_paths"].get(name), Path(self.config["provider_profiles"][name]) if name in self.config["provider_profiles"] else None).probe() for name in names}
-                if self.config["codex_backend"] == "shared":
+                if not self.recovery_only and self.config["codex_backend"] == "shared":
                     from .shared_adapter import SharedCodexAdapter
                     providers["codex"] = SharedCodexAdapter(self.root).probe()
-                self.api.register(self.root, {"providers": providers, "hostname": socket.gethostname(), "contract_version": "1", "operations": ["repo_inspect", "planner", "agent_task", "test", "review", "git_commit", "integrate"]}, self.project_ids, self.project_roots)
+                operations = [] if self.recovery_only else ["repo_inspect", "planner", "agent_task", "test", "review", "git_commit", "integrate"]
+                self.api.register(self.root, {"providers": providers, "hostname": socket.gethostname(), "contract_version": "1", "operations": operations,
+                                             "recovery_only": self.recovery_only}, self.project_ids, self.project_roots)
                 if os.name == "posix":
                     signal.signal(signal.SIGTERM, lambda *_: self.stopping.set())
                     signal.signal(signal.SIGINT, lambda *_: self.stopping.set())
@@ -178,11 +211,18 @@ class WorkerService:
                 claim_cursor = "0-0"
                 while not self.stopping.is_set():
                     try:
+                        if self.recovery_only:
+                            self._recover_local()
                         self._ack_completed()
                         active = self._active()
                         if time.monotonic() - last_heartbeat >= 10:
                             self.api.worker_heartbeat([str(item.read()["execution_id"]) for item in active])
                             last_heartbeat = time.monotonic()
+                        if self.recovery_only:
+                            # Journal message IDs suffice for recovery. Do not
+                            # reassign any unknown/foreign Redis pending work.
+                            self.stopping.wait(0.5)
+                            continue
                         capacity = self.max_parallel - len(active)
                         if capacity <= 0:
                             self.stopping.wait(0.5)

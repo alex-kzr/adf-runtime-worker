@@ -72,7 +72,9 @@ def policy_request(policy, job, number=0):
     allocation = {**job, "execution_id": str(uuid4()), "run_id": str(uuid4()), "task_id": str(uuid4()), "project_id": str(uuid4())}
     workspace = GitWorkspaceManager(policy.root, require_ext4=False).allocate(allocation)
     return Request(allocation["execution_id"], allocation["run_id"], 1, workspace.path, "synthetic policy job", 8,
-                   journal_path=workspace.journal.path, permission_profile="trusted-development", model="model-" + str(number))
+                   # Sealed policy supports read-only only: fake providers must
+                   # not claim compatibility with native synthetic mount writes.
+                   journal_path=workspace.journal.path, permission_profile="observe", model="model-" + str(number))
 
 
 def policy_execute(runtime, job, cancellation=None):
@@ -101,10 +103,58 @@ def test_policy_three_allocations_use_owner_trust_without_config_write(server, s
     assert len(starts) == 3
     assert len({start["params"]["cwd"] for start in starts}) == 3
     assert all(start["params"]["config"]["projects"] == policy.projects for start in starts)
+    assert all(start["params"]["sandbox"] == "read-only" for start in starts)
     assert not (policy.profile / "config.toml").exists()
     policy.check()
     for request in jobs:
         check_receipt(policy.root, Journal(request.journal_path).read())
+
+
+def test_sealed_write_preflight_has_no_materialization_or_generation_block(server, sealed_policy, job, monkeypatch):
+    policy = sealed_policy
+    runtime, capture = server(root=policy.root, profile=policy.profile, policy=policy)
+    request = replace(policy_request(policy, job), permission_profile="trusted-development")
+    adapter = SharedCodexAdapter(runtime.root)
+    monkeypatch.setattr(adapter.runner, "run", lambda *_args, **_kwargs: pytest.fail("Unsupported write launched a bridge"))
+    events = []
+    before = Journal(request.journal_path).read()
+    with FileLock(runtime.root / "locks" / ("execution-" + request.execution_id + ".lock")) as lock:
+        with pytest.raises(WorkerError) as error:
+            adapter.execute(replace(request, lock_fd=lock.fd), lambda *args: events.append(args), Event())
+    assert error.value.code == "CAPABILITY_UNSUPPORTED"
+    assert Journal(request.journal_path).read() == before
+    assert not events and not (request.workspace_path / ".agents").exists()
+    assert not wire_methods(capture, "thread/start") and not wire_methods(capture, "turn/start")
+    assert not runtime.policy_blocked.is_set()
+    for _ in range(3):
+        health = adapter.probe()
+        assert health["health"] == "ready" and health["auth"] == "ready"
+        assert health["generation"] == runtime.generation and health["policy"] == "sealed"
+        assert health["permission_profiles"] == ["observe", "read_only"]
+        assert health["write_capability"] == {"supported": False, "error_code": "CAPABILITY_UNSUPPORTED"}
+        assert health["ready_for_real_execution"] is False
+    assert policy_execute(runtime, policy_request(policy, job, 1)).status == "succeeded"
+
+
+def test_sealed_owner_rejects_direct_write_ipc_with_no_thread_tombstone(server, sealed_policy, job, tmp_path, capsys):
+    policy = sealed_policy
+    runtime, capture = server(root=policy.root, profile=policy.profile, policy=policy)
+    request = replace(policy_request(policy, job), permission_profile="trusted-development")
+    generated = tmp_path / "direct-bridge"
+    generated.mkdir(mode=0o700)
+    with FileLock(runtime.root / "locks" / ("execution-" + request.execution_id + ".lock")) as lock:
+        SharedCodexAdapter(runtime.root).argv(replace(request, lock_fd=lock.fd), generated)
+        config = json.loads((generated / "shared-job.json").read_text())
+        assert bridge(config, "no native turn", lock.fd, request.journal_path, Event()) == 1
+    capsys.readouterr()
+    saved = Journal(job_path(runtime.root, request.execution_id)).read()
+    assert saved["status"] == "failed" and saved["code"] == "CAPABILITY_UNSUPPORTED"
+    assert saved["quiesced"] is True and saved["proof"] == "no_thread"
+    assert not wire_methods(capture, "thread/start") and not wire_methods(capture, "turn/start")
+    assert not runtime.policy_blocked.is_set()
+    assert shared_stopped(Journal(request.journal_path).read()["shared_session"])
+    assert policy_execute(runtime, policy_request(policy, job, 1)).status == "succeeded"
+    assert len(wire_methods(capture, "turn/start")) == 1
 
 
 def test_policy_review_dispatch_uses_target_allocator_and_target_lock(server, sealed_policy, job):

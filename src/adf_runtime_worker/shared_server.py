@@ -271,7 +271,12 @@ class SharedServer:
                     except WorkerError:
                         pass
                 ready = authenticated and not self.policy_blocked.is_set()
-                send_frame(connection, {"health": "ready" if ready else "blocked", "auth": "ready" if authenticated else "required", "generation": self.generation})
+                send_frame(connection, {"health": "ready" if ready else "blocked", "auth": "ready" if authenticated else "required",
+                                        "generation": self.generation, "policy": "blocked" if self.policy_blocked.is_set() else "sealed" if self.policy else "default",
+                                        "permission_profiles": ["observe", "read_only"] if self.policy else ["observe", "read_only", "trusted-development"],
+                                        "write_capability": {"supported": self.policy is None,
+                                                             "error_code": "CAPABILITY_UNSUPPORTED" if self.policy else None},
+                                        "ready_for_real_execution": False})
                 return
             if frame.get("op") != "job":
                 raise WorkerError("INVALID_REQUEST", "Unknown shared operation")
@@ -345,6 +350,10 @@ class SharedServer:
                     raise WorkerError("PERMISSION_DENIED", "Shared MCP configuration is not a private journal-scoped file")
             with self.dispatch_lock:
                 self._check_policy()
+                if self.policy and params["sandbox"] == "workspace-write":
+                    # Pinned Linux sandbox creates a transient host .codex mount
+                    # target. Strict no_layers cannot authorize that write mode.
+                    raise WorkerError("CAPABILITY_UNSUPPORTED", "Sealed shared policy does not support workspace-write")
                 if self.policy:
                     self.policy.bind(frame["execution_id"], workspace, self.generation)
                     # The client was validated above; only the owner adds trust.
