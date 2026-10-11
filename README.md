@@ -12,7 +12,10 @@ Python 3.12.9 and uv 0.12.18 are the verified local tooling. Install the exact d
 uv venv --python 3.12.9 .venv
 uv pip install --python .venv/bin/python -r requirements.lock
 uv pip install --python .venv/bin/python --no-deps -e .
-.venv/bin/adf-worker doctor --root /home/your-user/ai-factory --node /absolute/path/to/node
+.venv/bin/adf-worker doctor \
+  --root /home/your-user/ai-factory --node /absolute/path/to/node \
+  --codex-home /home/your-user/ai-factory/provider-profiles/codex \
+  --claude-config-dir /home/your-user/ai-factory/provider-profiles/claude
 .venv/bin/adf-worker serve \
   --root /home/your-user/ai-factory \
   --project-root /home/your-user/ai-factory/projects \
@@ -24,7 +27,7 @@ uv pip install --python .venv/bin/python --no-deps -e .
   --codex /absolute/path/to/codex --claude /absolute/path/to/claude
 ```
 
-CLI version pins: Codex 0.157.0, Claude Code 2.1.296; the Codex JavaScript launcher also requires verified Node 24.21.0. `--node` adds only that configured executable directory to the sanitized Linux PATH. A mismatch blocks execution. Authenticate interactively using each provider's official CLI under the same regular Linux user; the worker does not log in, copy credentials or fall back to paid API access. Flags were checked against installed help on 2026-10-10. `doctor` uses official read-only auth status and emits only installation/auth readiness metadata. It also reports supplemental groups and Docker socket exposure without changing permissions. `execution_capabilities_available` is separate from `ready_for_real_execution`, which remains false until dedicated-account and umbrella acceptance gates are proved.
+CLI version pins: Codex 0.157.0, Claude Code 2.1.296; the Codex JavaScript launcher also requires verified Node 24.21.0. `--node` adds only that configured executable directory to the sanitized Linux PATH. A mismatch blocks execution. Authenticate interactively using each provider's official CLI under the same regular Linux user; the worker does not log in, copy credentials or fall back to paid API access. Flags were checked against installed help on 2026-10-10. `doctor` uses official read-only auth status with explicitly selected private profiles and emits only installation/auth readiness metadata. Omitted profiles are not probed and report `PROFILE_REQUIRED`; it does not inherit shell selectors or fall back to default auth stores. See [diagnostic profile selection and regression evidence](docs/doctor-profiles.md). It also reports supplemental groups and Docker socket exposure without changing permissions. `execution_capabilities_available` is separate from `ready_for_real_execution`, which remains false until dedicated-account and umbrella acceptance gates are proved.
 
 ## Development and evidence
 

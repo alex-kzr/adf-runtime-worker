@@ -16,8 +16,18 @@ from .models import WorkerError
 from .service import WorkerService
 from .supervisor import supervise_ticket
 
-def doctor(root: Path | None = None, provider_paths: dict[str, str] | None = None) -> dict[str, object]:
-    providers = {name: provider_adapter(name, (provider_paths or {}).get(name)).probe() for name in ("codex", "claude", "mock")}
+def doctor(root: Path | None = None, provider_paths: dict[str, str] | None = None,
+           provider_profiles: dict[str, str] | None = None) -> dict[str, object]:
+    providers = {"mock": provider_adapter("mock").probe()}
+    for name in ("codex", "claude"):
+        directory = (provider_profiles or {}).get(name)
+        if directory is None:
+            # Diagnostics must never discover a different auth store implicitly.
+            providers[name] = {"provider": name, "installed": None, "auth": "unknown", "health": "blocked",
+                               "error_code": "PROFILE_REQUIRED", "probe_performed": False, "profile_directory": None}
+            continue
+        providers[name] = {**provider_adapter(name, (provider_paths or {}).get(name), Path(directory)).probe(),
+                           "probe_performed": True, "profile_directory": directory, "login_per_job": False}
     linux = platform.system() == "Linux"
     root_ok = False
     error = None
@@ -45,6 +55,8 @@ def main() -> None:
     probe.add_argument("--node", default=os.getenv("ADF_NODE_PATH", str(Path.home() / ".local" / "bin" / "node")))
     probe.add_argument("--codex", default=os.getenv("ADF_CODEX_PATH"))
     probe.add_argument("--claude", default=os.getenv("ADF_CLAUDE_PATH"))
+    probe.add_argument("--codex-home", type=Path, help="Existing private Codex profile; omitted profiles are not probed")
+    probe.add_argument("--claude-config-dir", type=Path, help="Existing private Claude profile; omitted profiles are not probed")
     mock = sub.add_parser("mock")
     mock.add_argument("--request", type=Path, required=True)
     execute = sub.add_parser("execute")
@@ -79,7 +91,10 @@ def main() -> None:
                 raise WorkerError("INVALID_PATH", "Node runtime must be an explicit Linux executable")
             os.environ["ADF_NODE_PATH"] = str(node)
         if args.command == "doctor":
-            print(json.dumps(doctor(args.root, {key: value for key, value in {"codex": args.codex, "claude": args.claude}.items() if value})))
+            print(json.dumps(doctor(args.root,
+                                    {key: value for key, value in {"codex": args.codex, "claude": args.claude}.items() if value},
+                                    {key: str(value) for key, value in {"codex": args.codex_home,
+                                                                      "claude": args.claude_config_dir}.items() if value})))
         elif args.command == "supervise":
             supervise_ticket(args.ticket)
         elif args.command == "provider-server":
