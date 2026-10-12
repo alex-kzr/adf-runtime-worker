@@ -1486,3 +1486,107 @@ def test_new_shared_generation_clears_prior_initialize_failure(server, tmp_path)
     assert current["rpc_failure"] is None and current["stopped"] is False
     assert len(wire_methods(capture, "initialize")) == 1
     assert not wire_methods(capture, "thread/start") and not wire_methods(capture, "turn/start")
+
+
+@pytest.mark.skipif(not all(os.environ.get(name) for name in ("ADF_TEST_CODEX_PATH", "ADF_TEST_NODE_PATH", "ADF_TEST_CODEX_PACKAGE")),
+                    reason="Checksum-pinned public Node/npm fixtures must be supplied")
+@pytest.mark.parametrize("profile_mode", ["read_only", "sqlite_redirect", "writable"])
+def test_public_initialize_profile_write_contract(native_policy, persistent_metadata_fixture, monkeypatch, profile_mode):
+    """Initialize only: RO home fails; private SQLite alone still needs installation_id."""
+    import selectors
+    import signal
+    from unittest.mock import patch
+    from adf_runtime_worker.adapters import CodexAdapter
+    from adf_runtime_worker.profiles import ProviderProfile
+    from adf_runtime_worker.journal import stop_owned_session
+
+    policy = native_policy.policy
+    root, profile = policy.root, policy.profile
+    node = Path(os.environ["ADF_TEST_NODE_PATH"])
+    package = Path(os.environ["ADF_TEST_CODEX_PACKAGE"])
+    executable = Path(os.environ["ADF_TEST_CODEX_PATH"])
+    bwrap = executable.parent.parent / "codex-resources/bwrap"
+    public = {node: "7fde7b8afa198da66257f42ee2001d874c7355631e6d1579a5fb5ef1f246df4c",
+              package / "bin/codex.js": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70",
+              executable: "1a822376d4634ac32dddc030e5117c63359f7f8cd4b1b64382c68190287d0258",
+              bwrap: "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c"}
+    for path, expected in public.items():
+        assert path.resolve() == path and path.is_file()
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == expected
+    assert not list(profile.iterdir())
+    directory = root / "providers/codex"
+    directory.mkdir(parents=True, mode=0o700)
+    launcher = root / "tools/public-entry/bin/codex"
+    launcher.parent.mkdir(parents=True, mode=0o700)
+    launcher.symlink_to(package / "bin/codex.js")
+    alias = launcher.parent.parent / "codex-resources/bwrap"
+    alias.parent.mkdir(mode=0o700)
+    alias.symlink_to(bwrap)
+    worker_bin = root / "tools/worker-venv/bin"
+    worker_bin.mkdir(parents=True, mode=0o700)
+    production = {"HOME": str(root.parent), "USER": "adf-worker", "LOGNAME": "adf-worker", "LANG": "C.UTF-8",
+                  "PATH": str(node.parent) + ":" + str(worker_bin) + ":/usr/bin:/bin", "ADF_NODE_PATH": str(node)}
+    with patch.dict(os.environ, production, clear=True), patch.object(CodexAdapter, "probe", lambda *_: {"health": "ready"}):
+        argv, environment, selected = server_command(str(launcher), ProviderProfile("codex", profile), policy, native_policy)
+    assert selected == profile and set(environment) == {
+        "HOME", "USER", "LOGNAME", "LANG", "PATH", "CODEX_HOME", "GIT_TERMINAL_PROMPT", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL"}
+    monkeypatch.setenv("ADF_TEST_NATIVE_ROOT", str(root))
+    monkeypatch.setenv("ADF_TEST_NATIVE_CODEX", str(launcher))
+    outer = persistent_metadata_fixture.command({"cwd": str(directory), "config": {}}, profile_path=profile, environment=environment)
+    # Keep every initialize-only child in the Popen-owned SID; no model/tool starts.
+    outer.remove("--new-session")
+    binds = ["--disable-userns"]
+    for public_root in sorted({node.parent.parent, package, executable.parents[3]}):
+        binds += ["--ro-bind", str(public_root), str(public_root)]
+    if profile_mode != "writable":
+        binds += ["--ro-bind", str(profile), str(profile)]
+    index = outer.index("--")
+    outer[index:index] = binds
+    outer += argv[1:]
+    if profile_mode == "sqlite_redirect":
+        outer += ["-c", 'sqlite_home="/tmp/adf-initialize-private-sqlite"']
+    # The pinned standalone Python build lacks these APIs; exercise its existing ABI fallback.
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+    process = subprocess.Popen(outer, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env={"LANG": "C.UTF-8"}, start_new_session=True, close_fds=True)
+    identity = process_identity(process.pid)
+    output, errors, received, succeeded = bytearray(), bytearray(), 0, False
+    started = time.monotonic()
+    try:
+        process.stdin.write(json.dumps({"id": 1, "method": "initialize", "params": {
+            "clientInfo": {"name": "adf-worker", "version": "0.1.0"}, "capabilities": {"experimentalApi": True}}}).encode() + b"\n")
+        process.stdin.flush()
+        with selectors.DefaultSelector() as streams:
+            streams.register(process.stdout, selectors.EVENT_READ, "out")
+            streams.register(process.stderr, selectors.EVENT_READ, "err")
+            while streams.get_map() and not succeeded and time.monotonic() - started < 12:
+                for event, _ in streams.select(timeout=0.1):
+                    data = os.read(event.fd, 4096)
+                    if not data:
+                        streams.unregister(event.fileobj)
+                        continue
+                    received += len(data)
+                    assert received <= 65536
+                    buffer = errors if event.data == "err" else output
+                    buffer.extend(data)
+                    if event.data == "out":
+                        while (end := output.find(b"\n")) >= 0:
+                            reply = json.loads(bytes(output[:end]))
+                            del output[:end + 1]
+                            if reply.get("id") == 1:
+                                succeeded = "result" in reply
+        if profile_mode == "writable":
+            assert succeeded
+        else:
+            assert not succeeded and process.wait(timeout=3) == 1
+            expected = b"failed to initialize sqlite state runtime" if profile_mode == "read_only" else b"Read-only file system"
+            assert expected in errors
+    finally:
+        assert stop_owned_session(identity, grace_sec=0.5, kill_wait_sec=1)
+        process.wait(timeout=3)
+        assert not group_alive(identity)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+        assert time.monotonic() - started < 20
+    assert not (profile / "auth.json").exists()
