@@ -1098,7 +1098,8 @@ def test_native_private_boundaries_cannot_overlap_system_grants(native_policy, m
 
 
 @pytest.mark.skipif(not os.environ.get("ADF_TEST_CODEX_PATH"), reason="Pinned public native fixture must be explicitly supplied")
-def test_real_persistent_native_owner_configuration_without_turns(native_policy, job, monkeypatch):
+@pytest.mark.parametrize("launcher_mode", ["native", "node"])
+def test_real_persistent_native_owner_configuration_without_turns(native_policy, job, monkeypatch, launcher_mode):
     """Production baseline -> multiple job overrides; actual metadata only."""
     import stat
     from contextlib import ExitStack
@@ -1110,7 +1111,7 @@ def test_real_persistent_native_owner_configuration_without_turns(native_policy,
     from adf_runtime_worker.shared_rpc import RpcError
     import importlib.util
     fixture = Path(__file__).parent / "fixtures/native_read_canary.py"
-    spec = importlib.util.spec_from_file_location("adf_native_metadata_canary", fixture)
+    spec = importlib.util.spec_from_file_location(f"adf_native_metadata_canary_{launcher_mode}", fixture)
     module = importlib.util.module_from_spec(spec)
     # Retained owners/resources stay rooted even after a failed test traceback.
     sys.modules[spec.name] = module
@@ -1118,6 +1119,11 @@ def test_real_persistent_native_owner_configuration_without_turns(native_policy,
     policy = native_policy.policy
     source = Path(os.environ["ADF_TEST_CODEX_PATH"])
     vendor = policy.root / "tools" / "native-vendor"
+    if launcher_mode == "node":
+        if not os.environ.get("ADF_TEST_NODE_PATH") or not os.environ.get("ADF_TEST_CODEX_PACKAGE"):
+            pytest.skip("Pinned public Node and npm launcher fixture must be explicitly supplied")
+        package_root = policy.root / "tools/provider-cli/lib/node_modules/@openai/codex"
+        vendor = package_root / "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl"
     fingerprints = {"bin/codex": "1a822376d4634ac32dddc030e5117c63359f7f8cd4b1b64382c68190287d0258",
                     "codex-resources/bwrap": "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c"}
     for relative, expected in fingerprints.items():
@@ -1137,6 +1143,40 @@ def test_real_persistent_native_owner_configuration_without_turns(native_policy,
         after = original.stat(follow_symlinks=False)
         assert (before.st_atime_ns, before.st_mtime_ns, before.st_ctime_ns) == (after.st_atime_ns, after.st_mtime_ns, after.st_ctime_ns)
 
+    launcher = vendor / "bin/codex"
+    environment = None
+    if launcher_mode == "node":
+        originals = Path(os.environ["ADF_TEST_CODEX_PACKAGE"])
+        node = policy.root / "tools/node-24.21.0/node-v24.21.0-linux-x64/bin/node"
+        public_files = [
+            (Path(os.environ["ADF_TEST_NODE_PATH"]), node, "7fde7b8afa198da66257f42ee2001d874c7355631e6d1579a5fb5ef1f246df4c", 0o700),
+            (originals / "bin/codex.js", package_root / "bin/codex.js", "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70", 0o700),
+            (originals / "package.json", package_root / "package.json", "3d6d5d41091c12d2e32c7d9866c9f1fcdd8a0904eafcf3c4e15f445fb497f853", 0o600),
+            (source.parents[3] / "package.json", vendor.parent.parent / "package.json", "fc7f7d7ee9011189bd48e934f6af2527def360405021eebf30fbd89e1964834a", 0o600)]
+        for original, target, expected, mode in public_files:
+            before = original.stat(follow_symlinks=False)
+            assert stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+            target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOATIME)
+            digest = hashlib.sha256()
+            with os.fdopen(fd, "rb") as incoming, target.open("xb") as output:
+                while chunk := incoming.read(1024 * 1024):
+                    digest.update(chunk)
+                    output.write(chunk)
+            target.chmod(mode)
+            assert digest.hexdigest() == expected
+            after = original.stat(follow_symlinks=False)
+            assert (before.st_atime_ns, before.st_mtime_ns, before.st_ctime_ns) == (after.st_atime_ns, after.st_mtime_ns, after.st_ctime_ns)
+        launcher = policy.root / "tools/provider-cli/bin/codex"
+        launcher.parent.mkdir(mode=0o700)
+        launcher.symlink_to("../lib/node_modules/@openai/codex/bin/codex.js")
+        worker_bin = policy.root / "tools/worker-venv/bin"
+        worker_bin.mkdir(parents=True, mode=0o700)
+        # Only synthetic/public values: never read an installed process environ.
+        production_input = {"HOME": str(policy.root.parent), "USER": "adf-worker", "LOGNAME": "adf-worker", "LANG": "C.UTF-8",
+                            "PATH": str(node.parent) + ":" + str(worker_bin) + ":/usr/bin:/bin", "ADF_NODE_PATH": str(node),
+                            "DISABLE_UPDATES": "1", "DISABLE_AUTOUPDATER": "1", "NODE_OPTIONS": "ADF_SYNTHETIC_DENIED",
+                            "OPENAI_API_KEY": "ADF_SYNTHETIC_DENIED", "CODEX_MANAGED_BY_NPM": "ADF_SYNTHETIC_DENIED"}
     native_policy.manifest.write_text(json.dumps({"version": 1, "read_tool_roots": [str(vendor)]}))
     selected = NativeReadPolicy(policy, native_policy.manifest)
     monkeypatch.setenv("ADF_TEST_NATIVE_ROOT", str(policy.root))
@@ -1144,12 +1184,26 @@ def test_real_persistent_native_owner_configuration_without_turns(native_policy,
     monkeypatch.setenv("HOME", str(policy.root.parent))
     # Empty-profile metadata reproduction only. No auth check/login/refresh.
     monkeypatch.setattr(CodexAdapter, "probe", lambda *_: {"health": "ready"})
-    argv, _, profile = server_command(str(vendor / "bin/codex"), ProviderProfile("codex", policy.profile), policy, selected)
+    if launcher_mode == "node":
+        from unittest.mock import patch
+        with patch.dict(os.environ, production_input, clear=True):
+            argv, environment, profile = server_command(str(launcher), ProviderProfile("codex", policy.profile), policy, selected)
+        assert environment == {"HOME": str(policy.root.parent), "USER": "adf-worker", "LOGNAME": "adf-worker", "LANG": "C.UTF-8",
+                               "PATH": production_input["PATH"], "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
+                               "GIT_CONFIG_GLOBAL": "/dev/null", "CODEX_HOME": str(profile)}
+        version = subprocess.run([str(node), "--version"], env=environment, capture_output=True, timeout=5, check=True)
+        assert version.stdout.strip() == b"v24.21.0"
+        version = subprocess.run([str(launcher), "--version"], env=environment, capture_output=True, timeout=5, check=True)
+        assert version.stdout.strip() == b"codex-cli 0.157.0"
+        direct_argv, _, _ = server_command(str(vendor / "bin/codex"), ProviderProfile("codex", policy.profile), policy, selected)
+        assert argv[1:] == direct_argv[1:]
+    else:
+        argv, _, profile = server_command(str(launcher), ProviderProfile("codex", policy.profile), policy, selected)
     assert 'mcp_servers={}' in argv and 'features.skip_host_skill_discovery=true' in argv
     assert not (profile / "auth.json").exists()
     requests = [policy_request(policy, job, 0), capability_job(selected, job, 1, 30),
                 capability_job(selected, job, 2, 30, skill_name="alternate", server_name="alternatefiles", tool_name="read_file")]
-    owner = module.PersistentMetadataOwner(argv, policy.root, profile)
+    owner = module.PersistentMetadataOwner(argv, policy.root, profile, environment=environment)
     params = []
     summaries = []
     thread_ids = []
@@ -1206,7 +1260,9 @@ def test_real_persistent_native_owner_configuration_without_turns(native_policy,
         selected.check()
         assert owner.methods.count("thread/start") == owner.methods.count("thread/unsubscribe") == 6
         assert not any(method.startswith("turn/") for method in owner.methods)
-        print(json.dumps({"persistent_metadata_owner": True, "sequential_threads": 3, "parallel_threads": 3,
+        print(json.dumps({"persistent_metadata_owner": True, "launcher_mode": launcher_mode,
+                          "production_env_names": sorted(environment) if environment else [],
+                          "sequential_threads": 3, "parallel_threads": 3,
                           "native_turn_calls": 0, "summaries": summaries}))
     except RpcError as error:
         pytest.fail("Persistent native metadata failed: " + json.dumps(error.receipt()), pytrace=False)

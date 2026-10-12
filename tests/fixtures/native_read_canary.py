@@ -22,7 +22,7 @@ def toml(value):
     return json.dumps(value)
 
 
-def command(params, *, owner_startup=False, profile_path=None):
+def command(params, *, owner_startup=False, profile_path=None, environment=None):
     root = Path(os.environ["ADF_TEST_NATIVE_ROOT"])
     cli = Path(os.environ["ADF_TEST_NATIVE_CODEX"])
     bwrap = cli.parent.parent / "codex-resources" / "bwrap"
@@ -44,8 +44,15 @@ def command(params, *, owner_startup=False, profile_path=None):
         outer += ["--symlink", source, target]
     # Private namespace tmpfs only, never a shared host temp directory.
     outer += ["--bind", str(root), str(root), "--chdir", params["cwd"]]
-    for key, value in {"HOME": str(home), "CODEX_HOME": str(profile), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
-                       "DISABLE_UPDATES": "1", "PYTHONDONTWRITEBYTECODE": "1"}.items():
+    selected_environment = environment if environment is not None else {
+        "HOME": str(home), "CODEX_HOME": str(profile), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+        "DISABLE_UPDATES": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+    if environment is not None:
+        from adf_runtime_worker.security import _SAFE_ENV
+        assert set(environment) <= _SAFE_ENV | {"CODEX_HOME", "GIT_TERMINAL_PROMPT", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL"}
+        assert environment["CODEX_HOME"] == str(profile)
+        assert Path(environment["HOME"]) in {root, root.parent, home}
+    for key, value in selected_environment.items():
         outer += ["--setenv", key, value]
     outer += ["--", str(cli)]
     config = dict(params["config"])
@@ -143,12 +150,16 @@ RETAINED_METADATA_RESOURCES = []
 
 class PersistentMetadataOwner:
     """Actual production argv/cwd, empty profile, one owner; no native turns."""
-    def __init__(self, argv, root, profile, *, cleanup_timeout=3):
+    def __init__(self, argv, root, profile, *, cleanup_timeout=3, environment=None):
         from adf_runtime_worker.shared_rpc import Rpc
         directory = root / "providers" / "codex"
         directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-        outer = command({"cwd": str(directory), "config": {}}, profile_path=profile)
-        assert outer[-1] == argv[0]
+        outer = command({"cwd": str(directory), "config": {}}, profile_path=profile, environment=environment)
+        if environment is None:
+            assert outer[-1] == argv[0]
+        else:
+            executable = Path(argv[0])
+            assert executable.is_relative_to(root / "tools") and executable.resolve().is_relative_to(root / "tools")
         self.methods = []
         self.lock = threading.Lock()
         self.close_lock = threading.Lock()
