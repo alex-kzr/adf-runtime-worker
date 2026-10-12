@@ -873,20 +873,20 @@ def test_direct_shared_owner_requires_native_policy_before_spawn(tmp_path):
     assert error.value.code == "CAPABILITY_UNSUPPORTED" and not runtime.directory.exists()
 
 
-def capability_job(native_policy, job, number=0, maximum=8):
+def capability_job(native_policy, job, number=0, maximum=8, *, skill_name="scoped", server_name="files", tool_name="read_marker"):
     from adf_runtime_worker.capabilities import approved_capabilities
     root = native_policy.policy.root
-    skill = root / "skills" / "scoped" / "SKILL.md"
+    skill = root / "skills" / skill_name / "SKILL.md"
     skill.parent.mkdir(parents=True, mode=0o700)
-    content = "---\nname: scoped\ndescription: synthetic approved skill\n---\nRead the assigned marker.\n"
+    content = "---\nname: " + skill_name + "\ndescription: synthetic approved skill\n---\nRead the assigned marker.\n"
     skill.write_text(content)
     skill.chmod(0o600)
-    mcp = {"name": "files", "trusted": True, "transport": "stdio",
+    mcp = {"name": server_name, "trusted": True, "transport": "stdio",
            "argv": ["python3", "-m", "adf_runtime_worker.scoped_mcp"], "allowed_tools": ["read_file", "read_marker"],
            "scope": {"contract": "adf.scoped-files.v1", "root": "$WORKTREE", "read_paths": ["README.md"], "max_bytes": 4096}, "timeout_sec": 8}
     body = {**job, "timeout_sec": maximum, "agent": {"provider": "codex", "permission_profile": "observe",
             "skills": [{"path": str(skill), "sha256": hashlib.sha256(content.encode()).hexdigest()}],
-            "mcp_servers": [mcp], "tools": [{"permission": "read", "provider_mappings": {"codex": ["mcp__files__read_marker"]}}]}}
+            "mcp_servers": [mcp], "tools": [{"permission": "read", "provider_mappings": {"codex": ["mcp__" + server_name + "__" + tool_name]}}]}}
     request = policy_request(native_policy.policy, body, number)
     skills, configs, tools = approved_capabilities(body["agent"], root, request.workspace_path, maximum, "observe")
     return replace(request, approved_skills=skills, mcp_config=configs, allowed_tools=tuple(tools))
@@ -1095,3 +1095,338 @@ def test_native_private_boundaries_cannot_overlap_system_grants(native_policy, m
     with pytest.raises(WorkerError) as error:
         module.NativeReadPolicy(SimpleNamespace(**values), native_policy.manifest)
     assert error.value.code == "PERMISSION_DENIED"
+
+
+@pytest.mark.skipif(not os.environ.get("ADF_TEST_CODEX_PATH"), reason="Pinned public native fixture must be explicitly supplied")
+def test_real_persistent_native_owner_configuration_without_turns(native_policy, job, monkeypatch):
+    """Production baseline -> multiple job overrides; actual metadata only."""
+    import stat
+    from contextlib import ExitStack
+    from concurrent.futures import ThreadPoolExecutor
+    from adf_runtime_worker.adapters import CodexAdapter
+    from adf_runtime_worker.profiles import ProviderProfile
+    from adf_runtime_worker.native_skills import native_skills
+    from adf_runtime_worker.native_read_policy import NativeReadPolicy
+    from adf_runtime_worker.shared_rpc import RpcError
+    import importlib.util
+    fixture = Path(__file__).parent / "fixtures/native_read_canary.py"
+    spec = importlib.util.spec_from_file_location("adf_native_metadata_canary", fixture)
+    module = importlib.util.module_from_spec(spec)
+    # Retained owners/resources stay rooted even after a failed test traceback.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    policy = native_policy.policy
+    source = Path(os.environ["ADF_TEST_CODEX_PATH"])
+    vendor = policy.root / "tools" / "native-vendor"
+    fingerprints = {"bin/codex": "1a822376d4634ac32dddc030e5117c63359f7f8cd4b1b64382c68190287d0258",
+                    "codex-resources/bwrap": "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c"}
+    for relative, expected in fingerprints.items():
+        original = source.parent.parent / relative
+        before = original.stat(follow_symlinks=False)
+        assert stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+        target = vendor / relative
+        target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOATIME)
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "rb") as incoming, target.open("xb") as output:
+            while chunk := incoming.read(1024 * 1024):
+                digest.update(chunk)
+                output.write(chunk)
+        target.chmod(0o700)
+        assert digest.hexdigest() == expected
+        after = original.stat(follow_symlinks=False)
+        assert (before.st_atime_ns, before.st_mtime_ns, before.st_ctime_ns) == (after.st_atime_ns, after.st_mtime_ns, after.st_ctime_ns)
+
+    native_policy.manifest.write_text(json.dumps({"version": 1, "read_tool_roots": [str(vendor)]}))
+    selected = NativeReadPolicy(policy, native_policy.manifest)
+    monkeypatch.setenv("ADF_TEST_NATIVE_ROOT", str(policy.root))
+    monkeypatch.setenv("ADF_TEST_NATIVE_CODEX", str(vendor / "bin/codex"))
+    monkeypatch.setenv("HOME", str(policy.root.parent))
+    # Empty-profile metadata reproduction only. No auth check/login/refresh.
+    monkeypatch.setattr(CodexAdapter, "probe", lambda *_: {"health": "ready"})
+    argv, _, profile = server_command(str(vendor / "bin/codex"), ProviderProfile("codex", policy.profile), policy, selected)
+    assert 'mcp_servers={}' in argv and 'features.skip_host_skill_discovery=true' in argv
+    assert not (profile / "auth.json").exists()
+    requests = [policy_request(policy, job, 0), capability_job(selected, job, 1, 30),
+                capability_job(selected, job, 2, 30, skill_name="alternate", server_name="alternatefiles", tool_name="read_file")]
+    owner = module.PersistentMetadataOwner(argv, policy.root, profile)
+    params = []
+    summaries = []
+    thread_ids = []
+    expected_models = {}
+    stack = ExitStack()
+    try:
+        models = owner.call("model/list", {"limit": 100})["data"]
+        defaults = [item["model"] for item in models if item["isDefault"]]
+        alternatives = [item["model"] for item in models if not item["isDefault"]]
+        assert len(defaults) == 1 and alternatives
+        for number, request in enumerate(requests):
+            lock = stack.enter_context(FileLock(policy.root / "locks" / ("execution-" + request.execution_id + ".lock")))
+            config_dir = policy.root / "journals" / ("metadata-" + str(number))
+            config_dir.mkdir(mode=0o700)
+            skill_config, _ = stack.enter_context(native_skills(request))
+            SharedCodexAdapter(policy.root).argv(replace(request, lock_fd=lock.fd, native_skill_config=skill_config), config_dir)
+            frame = json.loads((config_dir / "shared-job.json").read_text())
+            policy.bind(request.execution_id, request.workspace_path, "synthetic-metadata")
+            skill_paths = selected.validate_capabilities(request.execution_id, request.workspace_path, frame["start"]["config"])
+            selected.bind(request.execution_id, request.workspace_path, "synthetic-metadata")
+            effective = {**frame["start"], "allowProviderModelFallback": False,
+                         "config": {**frame["start"]["config"], "projects": policy.projects,
+                                    **selected.overrides(request.workspace_path, skill_paths)}}
+            effective.pop("sandbox")
+            # Exercise the real default route as well as catalog model overrides.
+            if number == 0:
+                effective.pop("model")
+            else:
+                effective["model"] = defaults[0] if number == 1 else alternatives[0]
+            expected_models[effective["cwd"]] = defaults[0] if number < 2 else alternatives[0]
+            params.append(effective)
+        for values in params:
+            result, summary = owner.metadata(values)
+            selected.verify_response(result, Path(values["cwd"]))
+            assert result["model"] == expected_models[values["cwd"]]
+            thread_ids.append(result["thread"]["id"])
+            summaries.append(summary)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for values, (result, summary) in zip(params, pool.map(owner.metadata, params), strict=True):
+                selected.verify_response(result, Path(values["cwd"]))
+                assert result["model"] == expected_models[values["cwd"]]
+                thread_ids.append(result["thread"]["id"])
+                summaries.append(summary)
+        assert len(summaries) == len(set(thread_ids)) == 6
+        for summary in summaries:
+            number = next(n for n, request in enumerate(requests) if summary["cwd"] == str(request.workspace_path))
+            assert summary["quiescence_proof"] == "thread_closed"
+            assert summary["mcp_servers"] == ([], ["files"], ["alternatefiles"])[number]
+            assert summary["mcp_tools"] == ([], ["read_marker"], ["read_file"])[number]
+            expected_skill = (None, "scoped", "alternate")[number]
+            enabled = [item["path"] for item in summary["skill_catalog"] if item["enabled"]]
+            assert enabled == ([summary["cwd"] + "/.agents/skills/" + expected_skill + "/SKILL.md"] if expected_skill else [])
+        policy.check()
+        selected.check()
+        assert owner.methods.count("thread/start") == owner.methods.count("thread/unsubscribe") == 6
+        assert not any(method.startswith("turn/") for method in owner.methods)
+        print(json.dumps({"persistent_metadata_owner": True, "sequential_threads": 3, "parallel_threads": 3,
+                          "native_turn_calls": 0, "summaries": summaries}))
+    except RpcError as error:
+        pytest.fail("Persistent native metadata failed: " + json.dumps(error.receipt()), pytrace=False)
+    finally:
+        try:
+            owner.close()
+        except BaseException:
+            # Keep materialized skills and lock FDs if owner death is unknown.
+            module.RETAINED_METADATA_RESOURCES.append((owner, stack))
+            raise
+        stack.close()
+    assert owner.process.poll() is not None and not (profile / "auth.json").exists()
+
+
+@pytest.mark.parametrize(("mode", "outcome"), [("rpc-provider-error", "provider_error"),
+                                               ("rpc-malformed", "malformed_response"), ("rpc-closure", "transport_closed")])
+def test_rpc_failure_receipt_survives_uncertain_fence_without_turn(server, native_policy, job, mode, outcome):
+    runtime, capture = native_server(server, native_policy, mode)
+    target = policy_request(native_policy.policy, job)
+    result = policy_execute(runtime, target)
+    assert result.status == "uncertain" and result.error_code == "EXECUTION_UNCERTAIN"
+    journal = Journal(job_path(runtime.root, target.execution_id)).read()
+    assert journal["rpc_failure"]["outcome"] == outcome
+    assert journal["rpc_failure"]["method"] == "thread/start" and journal["rpc_failure"]["phase"] == "thread_start"
+    assert journal["failure_phase"] == "thread_start"
+    assert "PRIVATE_SYNTHETIC_SECRET" not in json.dumps(journal)
+    assert not wire_methods(capture, "turn/start")
+    assert len(wire_methods(capture, "thread/start")) == 1
+    # Explicit errors still cannot prove no upstream side effect after intent.
+    if mode != "rpc-closure":
+        assert journal["quiesced"] is False and journal["proof"] is None
+        with pytest.raises(WorkerError, match="lock is held"):
+            with FileLock(runtime.root / "locks" / ("execution-" + target.execution_id + ".lock")):
+                pytest.fail("Uncertain allocation lock was released")
+        with pytest.raises(WorkerError, match="lock is held"):
+            policy_execute(runtime, target)
+        assert len(wire_methods(capture, "thread/start")) == 1
+
+
+@pytest.fixture
+def persistent_metadata_fixture():
+    import importlib.util
+    fixture = Path(__file__).parent / "fixtures/native_read_canary.py"
+    spec = importlib.util.spec_from_file_location("adf_fake_metadata_canary", fixture)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("mode", ["closed", "missing-close", "wrong-thread", "transport-closed",
+                                  "unacknowledged", "metadata-failed", "start-failed", "invalid-schema"])
+def test_persistent_metadata_waits_for_closed_or_stops_owner(persistent_metadata_fixture, monkeypatch, mode):
+    """In-memory RPC only: an unsubscribe response is not quiescence."""
+    import queue
+    from adf_runtime_worker.shared_rpc import RpcError
+    module = persistent_metadata_fixture
+    trace = []
+
+    class FakeRpc:
+        def __init__(self):
+            self.failed = Event()
+            self.events = queue.Queue()
+
+        def call(self, method, _params, timeout):
+            assert timeout == 12
+            trace.append(method)
+            if method == "thread/start":
+                if mode == "start-failed":
+                    raise RpcError(method, "response_timeout", 12)
+                return {"thread": {"id": "metadata-thread"}}
+            if method == "mcpServerStatus/list":
+                if mode == "metadata-failed":
+                    raise RpcError(method, "provider_error", 1, -32602)
+                return {"data": []}
+            if method == "skills/list":
+                return {"data": []}
+            assert method == "thread/unsubscribe"
+            if mode == "closed":
+                self.events.put({"method": "thread/status/changed", "params": {"threadId": "metadata-thread"}})
+                self.events.put({"method": "thread/closed", "params": {"threadId": "metadata-thread"}})
+            elif mode == "wrong-thread":
+                self.events.put({"method": "thread/closed", "params": {"threadId": "another-thread"}})
+            elif mode == "transport-closed":
+                self.failed.set()
+            return {"status": "PRIVATE_SYNTHETIC_SECRET" if mode == "unacknowledged" else "unsubscribed"}
+
+        def subscribe(self, thread_id):
+            assert thread_id == "metadata-thread"
+            trace.append("subscribe")
+            return self.events
+
+        def forget(self, thread_id):
+            assert thread_id == "metadata-thread"
+            trace.append("forget")
+
+    owner = module.PersistentMetadataOwner.__new__(module.PersistentMetadataOwner)
+    owner.methods = []
+    owner.lock = threading.Lock()
+    owner.cleanup_timeout = 0.02
+    owner.rpc = FakeRpc()
+    owner.close = lambda: trace.append("owner_stopped")
+
+    def validate(value, _schema):
+        if mode == "invalid-schema" and "thread" in value:
+            raise jsonschema.ValidationError("PRIVATE_SYNTHETIC_SECRET")
+    monkeypatch.setattr(module.jsonschema, "validate", validate)
+    if mode == "closed":
+        _, summary = owner.metadata({"cwd": "/synthetic-worktree"})
+        assert summary["quiescence_proof"] == "thread_closed"
+        assert "owner_stopped" not in trace
+        assert trace.index("subscribe") < trace.index("forget")
+    else:
+        with pytest.raises((RuntimeError, WorkerError)) as error:
+            owner.metadata({"cwd": "/synthetic-worktree"})
+        if mode == "start-failed":
+            assert "subscribe" not in trace and "forget" not in trace
+            assert trace[-1] == "owner_stopped"
+        else:
+            assert trace.index("subscribe") < trace.index("forget")
+            assert trace.index("owner_stopped") < trace.index("forget")
+        assert "PRIVATE_SYNTHETIC_SECRET" not in str(error.value)
+    assert not any(method.startswith("turn/") for method in owner.methods)
+
+
+@pytest.mark.parametrize("phase", ["transport", "initialize", "initialized"])
+def test_persistent_metadata_initialization_failure_stops_owner(persistent_metadata_fixture, tmp_path, monkeypatch, phase):
+    import io
+    from types import SimpleNamespace
+    from adf_runtime_worker import shared_rpc
+    module = persistent_metadata_fixture
+    trace = []
+
+    class FakeProcess:
+        stdin, stdout, stderr = io.BytesIO(), io.BytesIO(), io.BytesIO()
+        stopped = False
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+        def terminate(self):
+            trace.append("terminate")
+            self.stopped = True
+
+        def wait(self, timeout):
+            assert timeout == 3 and self.stopped
+            trace.append("wait")
+            return 0
+
+    process = FakeProcess()
+
+    class FakeRpc:
+        def __init__(self, _process):
+            if phase == "transport":
+                raise WorkerError("EXECUTION_UNCERTAIN", "Synthetic transport setup failed")
+            self.reader = SimpleNamespace(join=lambda timeout: trace.append("reader_join"), is_alive=lambda: False)
+
+        def call(self, method, _params, timeout):
+            assert method == "initialize" and timeout == 12
+            if phase == "initialize":
+                raise shared_rpc.RpcError(method, "provider_error", 1, -32602)
+            return {}
+
+        def send(self, value):
+            assert value["method"] == "initialized"
+            raise WorkerError("EXECUTION_UNCERTAIN", "Synthetic initialized write failed")
+
+    monkeypatch.setattr(module, "command", lambda *_args, **_kwargs: ["synthetic-native"])
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(shared_rpc, "Rpc", FakeRpc)
+    with pytest.raises(WorkerError):
+        module.PersistentMetadataOwner(["synthetic-native"], tmp_path, tmp_path / "empty-profile")
+    assert trace[:2] == ["terminate", "wait"]
+    assert process.poll() == 0
+    assert all(stream.closed for stream in (process.stdin, process.stdout, process.stderr))
+
+
+def test_persistent_metadata_owner_unproved_shutdown_keeps_streams(persistent_metadata_fixture):
+    import io
+    module = persistent_metadata_fixture
+    trace = []
+
+    class UnstoppedProcess:
+        stdin, stdout, stderr = io.BytesIO(), io.BytesIO(), io.BytesIO()
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            trace.append("terminate")
+
+        def kill(self):
+            trace.append("kill")
+
+        def wait(self, timeout):
+            assert timeout == 3
+            trace.append("wait")
+            raise subprocess.TimeoutExpired("PRIVATE_SYNTHETIC_SECRET", timeout)
+
+    owner = module.PersistentMetadataOwner.__new__(module.PersistentMetadataOwner)
+    owner.process = UnstoppedProcess()
+    owner.rpc = None
+    owner.close_lock = threading.Lock()
+    with pytest.raises(RuntimeError, match="shutdown was not proved") as error:
+        owner.close()
+    assert "PRIVATE_SYNTHETIC_SECRET" not in str(error.value)
+    assert trace == ["terminate", "wait", "kill", "wait"]
+    assert not any(stream.closed for stream in (owner.process.stdin, owner.process.stdout, owner.process.stderr))
+
+
+def test_new_shared_generation_clears_prior_initialize_failure(server, tmp_path):
+    root = tmp_path / "recovered-initialize"
+    previous_generation = str(uuid4())
+    state = Journal(root / "providers" / "codex" / "server.json")
+    state.path.parent.mkdir(parents=True, mode=0o700)
+    state.update(generation=previous_generation, stopped=True,
+                 rpc_failure={"method": "initialize", "outcome": "provider_error", "elapsed_ms": 1,
+                              "provider_error_code": -32602, "phase": "initialize"})
+    runtime, capture = server(root=root)
+    current = state.read()
+    assert current["generation"] == runtime.generation != previous_generation
+    assert current["rpc_failure"] is None and current["stopped"] is False
+    assert len(wire_methods(capture, "initialize")) == 1
+    assert not wire_methods(capture, "thread/start") and not wire_methods(capture, "turn/start")

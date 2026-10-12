@@ -24,7 +24,7 @@ from .profiles import ProviderProfile
 from .native_read_policy import NativeReadPolicy
 from .profile_policy import SealedProfilePolicy
 from .security import restricted_env
-from .shared_rpc import FRAME_LIMIT, Rpc
+from .shared_rpc import FRAME_LIMIT, Rpc, RpcError
 
 UNSAFE_FEATURES = ("multi_agent", "apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access",
                    "computer_use", "image_generation", "in_app_browser", "hooks", "plugins", "remote_plugin",
@@ -195,7 +195,7 @@ class SharedServer:
                     self.native_policy.check()
             elif self.profile:
                 clean_config(self.profile)
-            self.state.update(generation=self.generation, owner=process_identity(os.getpid()), server=None, stopped=False, policy_blocked=False,
+            self.state.update(generation=self.generation, owner=process_identity(os.getpid()), server=None, stopped=False, policy_blocked=False, rpc_failure=None,
                               native_read_policy=self.native_policy.receipt(self.generation) if self.native_policy else None)
             monitor: threading.Thread | None = None
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -205,8 +205,12 @@ class SharedServer:
                 identity = process_identity(self.process.pid)
                 self.state.update(server=identity)
                 self.rpc = Rpc(self.process)
-                self.rpc.call("initialize", {"clientInfo": {"name": "adf-worker", "version": "0.1.0"},
-                                             **({"capabilities": {"experimentalApi": True}} if self.native_policy else {})})
+                try:
+                    self.rpc.call("initialize", {"clientInfo": {"name": "adf-worker", "version": "0.1.0"},
+                                                 **({"capabilities": {"experimentalApi": True}} if self.native_policy else {})})
+                except RpcError as exc:
+                    self.state.update(rpc_failure={**exc.receipt(), "phase": "initialize"})
+                    raise
                 self.rpc.send({"method": "initialized", "params": {}})
                 if self.policy:
                     with self.dispatch_lock:
@@ -272,6 +276,7 @@ class SharedServer:
         status = "failed"
         code = "PROVIDER_FAILED"
         slot = False
+        phase = "accepted"
         try:
             if self.rpc is None:
                 raise WorkerError("EXECUTION_UNCERTAIN", "Shared provider is unavailable")
@@ -335,8 +340,11 @@ class SharedServer:
             if self.auth_blocked.is_set():
                 raise WorkerError("AUTH_REQUIRED", "Persistent provider dispatch is blocked until operator recovery")
             try:
+                phase = "account_read"
                 auth = self.rpc.call("account/read", {"refreshToken": False})
             except WorkerError as exc:
+                if isinstance(exc, RpcError):
+                    journal.update(rpc_failure={**exc.receipt(), "phase": phase})
                 raise WorkerError("AUTH_REQUIRED", "Persistent provider account is unavailable") from exc
             if not auth.get("account") or (self.native_policy and auth["account"].get("type") != "chatgpt"):
                 raise WorkerError("AUTH_REQUIRED", "Persistent provider profile is not authenticated")
@@ -386,18 +394,22 @@ class SharedServer:
                     params.pop("sandbox")
                     params["allowProviderModelFallback"] = False
                 self._check_policy()
+                phase = "thread_start"
                 journal.update(status="thread_spawn_intent")
                 started = self.rpc.call("thread/start", params)
                 thread_id = str(started["thread"]["id"])
                 journal.update(thread_id=thread_id, status="starting")
                 events = self.rpc.subscribe(thread_id)
+                phase = "verify_thread"
                 if self.native_policy:
                     self.native_policy.verify_response(started, workspace)
                 self._check_policy()
+                phase = "turn_start"
                 turn = self.rpc.call("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": frame["prompt"]}], "outputSchema": frame.get("schema")})
                 turn_id = str(turn["turn"]["id"])
                 journal.update(turn_id=turn_id, status="running")
                 self._check_policy()
+            phase = "await_turn"
             send_frame(connection, {"event": {"type": "thread.started", "thread_id": thread_id}})
             connection.settimeout(0.1)
             disconnected = False
@@ -452,6 +464,10 @@ class SharedServer:
             if not finished:
                 raise WorkerError("EXECUTION_UNCERTAIN", "Provider turn did not close")
         except (WorkerError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            if journal is not None:
+                journal.update(failure_phase=phase)
+                if isinstance(exc, RpcError):
+                    journal.update(rpc_failure={**exc.receipt(), "phase": phase})
             code = exc.code if isinstance(exc, WorkerError) else "EXECUTION_UNCERTAIN"
             if code == "AUTH_REQUIRED":
                 self.auth_blocked.set()
@@ -472,8 +488,9 @@ class SharedServer:
                                     break
                             except queue.Empty:
                                 continue
-                    except WorkerError:
-                        pass
+                    except WorkerError as exc:
+                        if isinstance(exc, RpcError):
+                            journal.update(cleanup_rpc_failure={**exc.receipt(), "phase": "cleanup"})
                 elif not thread_id:
                     # A timed-out thread/start might still create a thread. Its
                     # response uncertainty cannot produce a no-thread proof.

@@ -22,12 +22,12 @@ def toml(value):
     return json.dumps(value)
 
 
-def command(params, *, owner_startup=False):
+def command(params, *, owner_startup=False, profile_path=None):
     root = Path(os.environ["ADF_TEST_NATIVE_ROOT"])
     cli = Path(os.environ["ADF_TEST_NATIVE_CODEX"])
     bwrap = cli.parent.parent / "codex-resources" / "bwrap"
     assert root.resolve() == root and cli.is_relative_to(root / "tools")
-    profile = root / "native-metadata-profile"
+    profile = profile_path or root / "native-metadata-profile"
     profile.mkdir(mode=0o700, exist_ok=True)
     home = root / "native-metadata-home"
     home.mkdir(mode=0o700, exist_ok=True)
@@ -134,3 +134,102 @@ def probe(params):
         except ValueError:
             continue
     return {"gate_passed": False, "native_result_missing": True}
+
+
+# An unproved owner shutdown must keep its skills and allocation locks alive.
+# Failed canaries retain this evidence until the test process itself exits.
+RETAINED_METADATA_RESOURCES = []
+
+
+class PersistentMetadataOwner:
+    """Actual production argv/cwd, empty profile, one owner; no native turns."""
+    def __init__(self, argv, root, profile, *, cleanup_timeout=3):
+        from adf_runtime_worker.shared_rpc import Rpc
+        directory = root / "providers" / "codex"
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        outer = command({"cwd": str(directory), "config": {}}, profile_path=profile)
+        assert outer[-1] == argv[0]
+        self.methods = []
+        self.lock = threading.Lock()
+        self.close_lock = threading.Lock()
+        self.cleanup_timeout = cleanup_timeout
+        self.rpc = None
+        self.process = subprocess.Popen(outer[:-1] + argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, env={"LANG": "C.UTF-8"}, close_fds=True)
+        try:
+            self.rpc = Rpc(self.process)
+            self.call("initialize", {"clientInfo": {"name": "adf-worker", "version": "0.1.0"},
+                                     "capabilities": {"experimentalApi": True}})
+            self.rpc.send({"method": "initialized", "params": {}})
+        except BaseException:
+            self.close()
+            raise
+
+    def call(self, method, params):
+        # Never accept a model turn, authentication or arbitrary RPC method.
+        assert method in {"initialize", "model/list", "thread/start", "thread/unsubscribe", "skills/list", "mcpServerStatus/list"}
+        with self.lock:
+            self.methods.append(method)
+        return self.rpc.call(method, params, timeout=12)
+
+    def metadata(self, params):
+        thread_id = ""
+        try:
+            schemas = json.loads((Path(__file__).parent / "codex-0.157.0-native-read-schema.json").read_text())["schemas"]
+            jsonschema.validate(params, schemas["ThreadStartParams"])
+            result = self.call("thread/start", params)
+            thread_id = result["thread"]["id"]
+            events = self.rpc.subscribe(thread_id)
+            jsonschema.validate(result, schemas["ThreadStartResponse"])
+            catalog = self.call("mcpServerStatus/list", {"threadId": thread_id, "detail": "full"})
+            skills = self.call("skills/list", {"cwds": [params["cwd"]], "forceReload": True})
+            summary = {"cwd": params["cwd"], "schema_validated": True,
+                       "mcp_servers": sorted(item["name"] for item in catalog["data"]),
+                       "mcp_tools": sorted(tool["name"] for item in catalog["data"] for tool in item["tools"].values()),
+                       "skill_catalog": [{"path": item["path"], "enabled": item["enabled"]}
+                                         for entry in skills["data"] for item in entry["skills"]]}
+            acknowledgement = self.call("thread/unsubscribe", {"threadId": thread_id})
+            if acknowledgement.get("status") != "unsubscribed":
+                raise RuntimeError("Synthetic persistent metadata unsubscribe was not acknowledged")
+            until = time.monotonic() + self.cleanup_timeout
+            while time.monotonic() < until and not self.rpc.failed.is_set():
+                try:
+                    event = events.get(timeout=min(0.1, max(0.001, until - time.monotonic())))
+                except queue.Empty:
+                    continue
+                if event.get("method") == "thread/closed" and event.get("params", {}).get("threadId") == thread_id:
+                    summary["quiescence_proof"] = "thread_closed"
+                    return result, summary
+            raise RuntimeError("Synthetic persistent metadata thread closure was not proved")
+        except jsonschema.ValidationError:
+            self.close()
+            raise RuntimeError("Synthetic persistent metadata schema validation failed") from None
+        except BaseException:
+            # An uncertain start/unsubscribe or failed metadata read may leave
+            # native threads/MCP alive. Terminate the whole owner before unwind.
+            self.close()
+            raise
+        finally:
+            if thread_id and self.rpc is not None:
+                self.rpc.forget(thread_id)
+
+    def close(self):
+        # Metadata failures may close the shared owner from parallel callers.
+        with self.close_lock:
+            try:
+                if self.process.poll() is None:
+                    self.process.terminate()
+                try:
+                    self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=3)
+                if self.rpc is not None:
+                    self.rpc.reader.join(timeout=3)
+                    if self.rpc.reader.is_alive():
+                        raise RuntimeError("Synthetic persistent metadata owner shutdown was not proved")
+                for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                    if stream is not None:
+                        stream.close()
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                raise RuntimeError("Synthetic persistent metadata owner shutdown was not proved") from None

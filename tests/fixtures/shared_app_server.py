@@ -60,6 +60,12 @@ for line in sys.stdin:
             auth_path.write_text(json.dumps({"ADF_SYNTHETIC_OWNER_REFRESH": len(threads)}))
             auth_path.chmod(0o600)
         result = {"account": None if mode == "missing" else {"type": "apiKey" if mode == "api-key" else "chatgpt"}, "requiresOpenaiAuth": True}
+    elif method == "thread/start" and mode in {"rpc-provider-error", "rpc-malformed", "rpc-closure"}:
+        if mode == "rpc-closure":
+            os._exit(0)
+        value = {"error": {"code": -32602, "message": "PRIVATE_SYNTHETIC_SECRET", "data": {"token": "PRIVATE_SYNTHETIC_SECRET"}}} if mode == "rpc-provider-error" else {"result": {"thread": ["PRIVATE_SYNTHETIC_SECRET"]}}
+        send({"id": message["id"], **value})
+        continue
     elif method == "thread/start":
         thread_id = "thread-" + str(len(threads) + 1)
         threads[thread_id] = params
