@@ -1417,7 +1417,7 @@ def test_persistent_metadata_owner_unproved_shutdown_keeps_streams(persistent_me
 
 
 def test_new_shared_generation_clears_prior_initialize_failure(server, tmp_path):
-    root = tmp_path / "recovered-initialize"
+    root = tmp_path / "r"
     previous_generation = str(uuid4())
     state = Journal(root / "providers" / "codex" / "server.json")
     state.path.parent.mkdir(parents=True, mode=0o700)
