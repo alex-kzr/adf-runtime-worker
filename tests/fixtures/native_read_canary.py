@@ -2,6 +2,7 @@
 
 The outer namespace mounts one synthetic test root and public system libraries.
 It mounts no real HOME, /mnt, /run sockets, profiles or service configuration.
+Optional WSL/Nix trees contain only locally generated synthetic canaries.
 """
 import json
 import jsonschema
@@ -21,6 +22,27 @@ def toml(value):
         return "[" + ",".join(toml(item) for item in value) + "]"
     return json.dumps(value)
 
+
+def synthetic_platform(root, *, nix_alias=True):
+    """Expose WSL presence and the sole /run minimal root without host data."""
+    platform = root / "native-platform"
+    for relative in ("run/WSL/canary", "run/other/canary", "nix/store/adf-synthetic-system/canary"):
+        path = platform / relative
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path.write_text("ADF synthetic platform canary")
+        path.chmod(0o600)
+    sw = platform / "run/current-system/sw"
+    sw.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if nix_alias:
+        sw.symlink_to("/nix/store/adf-synthetic-system")
+    else:
+        sw.mkdir(mode=0o700)
+        (sw / "canary").write_text("ADF synthetic platform canary")
+    return [(name, path) for name, path in (
+        ("wsl_interop", "/run/WSL/canary"), ("run_other", "/run/other/canary"),
+        ("run_minimal", "/run/current-system/sw/canary"),
+        ("nix_alias_target", "/nix/store/adf-synthetic-system/canary"),
+        ("proc_self_run", "/proc/self/root/run/WSL/canary"))]
 
 def command(params, *, owner_startup=False, profile_path=None, environment=None):
     root = Path(os.environ["ADF_TEST_NATIVE_ROOT"])
@@ -43,6 +65,11 @@ def command(params, *, owner_startup=False, profile_path=None, environment=None)
     for source, target in (("usr/bin", "/bin"), ("usr/lib", "/lib"), ("usr/lib64", "/lib64")):
         outer += ["--symlink", source, target]
     # Private namespace tmpfs only, never a shared host temp directory.
+    platform = root / "native-platform"
+    if platform.is_dir():
+        # Public synthetic trees, never the host /run or /nix mounts.
+        for name in ("run", "nix"):
+            outer += ["--ro-bind", str(platform / name), "/" + name]
     outer += ["--bind", str(root), str(root), "--chdir", params["cwd"]]
     selected_environment = environment if environment is not None else {
         "HOME": str(home), "CODEX_HOME": str(profile), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
@@ -141,6 +168,61 @@ def probe(params):
         except ValueError:
             continue
     return {"gate_passed": False, "native_result_missing": True}
+
+
+def late_run_probe(params):
+    """Create host-side synthetic descendants only after native sandbox entry."""
+    import selectors
+    root = Path(os.environ["ADF_TEST_NATIVE_ROOT"])
+    workspace = Path(params["cwd"])
+    platform = root / "native-platform"
+    assert platform.is_dir() and workspace.is_relative_to(root)
+    paths = ["/run/late/deep/canary", "/run/current-system/late/canary", "/run/WSL/late/canary",
+             "/run/late-alias/canary", str(workspace / "late-run-alias/canary")]
+    program = """import json,pathlib,sys
+print('{"ready":true}',flush=True)
+assert sys.stdin.readline().strip()=='continue'
+results={}
+for path in json.loads(sys.argv[1]):
+    try:
+        pathlib.Path(path).read_bytes()
+        results[path]=False
+    except OSError:
+        results[path]=True
+inside=pathlib.Path('inside-canary').read_text()=='ADF synthetic project canary'
+print(json.dumps({'late_reads_denied':all(results.values()),'cases':len(results),'inside_read':inside}))
+"""
+    process = subprocess.Popen(command(params) + ["sandbox", "--", "/usr/bin/python3", "-I", "-B", "-c", program, json.dumps(paths)],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env={"LANG": "C.UTF-8"}, close_fds=True)
+    try:
+        with selectors.DefaultSelector() as streams:
+            streams.register(process.stdout, selectors.EVENT_READ)
+            assert streams.select(timeout=6), "Synthetic sandbox readiness timed out"
+            assert os.read(process.stdout.fileno(), 512) == b'{"ready":true}\n'
+        # These paths did not exist when config/mounts were built. Changing only
+        # synthetic backing trees also tests the already-mounted outer RO view.
+        for relative in ("run/late/deep/canary", "run/current-system/late/canary", "run/WSL/late/canary"):
+            path = platform / relative
+            path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            path.write_text("ADF synthetic late canary")
+            path.chmod(0o600)
+        (platform / "run/late-alias").symlink_to("/run/late/deep")
+        (workspace / "late-run-alias").symlink_to("/run/late/deep")
+        output, _ = process.communicate(input=b"continue\n", timeout=6)
+        assert process.returncode == 0
+        return json.loads(output)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
 
 
 # An unproved owner shutdown must keep its skills and allocation locks alive.

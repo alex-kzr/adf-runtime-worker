@@ -947,7 +947,8 @@ def test_native_direct_capability_forgery_never_starts_thread(server, native_pol
     assert Journal(job_path(runtime.root, request.execution_id)).read()["code"] == "PERMISSION_DENIED"
 
 @pytest.mark.skipif(not os.environ.get("ADF_TEST_CODEX_PATH"), reason="Pinned public native fixture must be explicitly supplied")
-def test_real_native_permissions_through_shared_ipc_without_model(server, native_policy, job):
+@pytest.mark.parametrize("nix_alias", [False, True])
+def test_real_native_permissions_through_shared_ipc_without_model(server, native_policy, job, nix_alias, persistent_metadata_fixture, monkeypatch):
     """Actual metadata + command sandbox; fake turns, never model acceptance."""
     import stat
     from adf_runtime_worker.native_read_policy import NativeReadPolicy
@@ -976,7 +977,7 @@ def test_real_native_permissions_through_shared_ipc_without_model(server, native
     selected = NativeReadPolicy(policy, native_policy.manifest)
     jobs = [replace(policy_request(policy, {**job, "timeout_sec": 30}, number), timeout_sec=30) for number in (0, 2)]
     jobs.insert(1, capability_job(selected, job, 1, 30))
-    canaries = []
+    canaries = persistent_metadata_fixture.synthetic_platform(policy.root, nix_alias=nix_alias)
     for label, path in (("outside", policy.root / "outside/canary"),
                         ("codex_auth", policy.profile / "auth.json"),
                         ("claude_auth", policy.root / "provider-profiles/claude/.credentials.json"),
@@ -994,6 +995,7 @@ def test_real_native_permissions_through_shared_ipc_without_model(server, native
             path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             path.write_text("ADF synthetic nested private canary")
             canaries.append((request.execution_id + ":" + name, str(path)))
+        (workspace / "run-alias").symlink_to("/run/current-system/sw")
         (workspace / "auth-link").symlink_to(policy.profile / "auth.json")
         os.link(policy.root / "outside/canary", workspace / "auth-hardlink")
         canaries.append((request.execution_id + ":hardlink", str(workspace / "auth-hardlink")))
@@ -1003,7 +1005,8 @@ def test_real_native_permissions_through_shared_ipc_without_model(server, native
         canaries.append((request.execution_id + ":unapproved-skill", str(unapproved)))
     for request in jobs:
         workspace = request.workspace_path
-        cases = canaries + [("auth_alias", str(workspace / "auth-link")),
+        cases = canaries + [("run_alias", str(workspace / "run-alias/canary")),
+                            ("auth_alias", str(workspace / "auth-link")),
                             ("parent_alias", str(workspace) + "/../../../outside/canary"),
                             ("proc_self_auth", "/proc/self/root" + str(policy.profile / "auth.json")),
                             ("proc_init_auth", "/proc/1/root" + str(policy.profile / "auth.json"))]
@@ -1040,6 +1043,22 @@ print(json.dumps({'canaries':results,'inside_read':inside,'write_denied':write_d
                    "ADF_TEST_NATIVE_CODEX": str(vendor / "bin/codex")}
     runtime, capture = server(mode="native-canary", root=policy.root, profile=policy.profile, policy=policy,
                               native_policy=selected, environment=environment)
+    policy.bind(jobs[0].execution_id, jobs[0].workspace_path, runtime.generation)
+    selected.bind(jobs[0].execution_id, jobs[0].workspace_path, runtime.generation)
+    monkeypatch.setenv("ADF_TEST_NATIVE_ROOT", str(policy.root))
+    monkeypatch.setenv("ADF_TEST_NATIVE_CODEX", str(vendor / "bin/codex"))
+    late = persistent_metadata_fixture.late_run_probe({"cwd": str(jobs[0].workspace_path),
+                                                     "config": selected.overrides(jobs[0].workspace_path)})
+    assert late == {"late_reads_denied": True, "cases": 5, "inside_read": True}
+    # The old parent mask must fail under the same synthetic WSL mount, while
+    # the reviewed named profile above has actually entered the sandbox.
+    previous = selected.overrides(jobs[0].workspace_path)
+    previous_fs = previous["permissions"]["adf_shared_read"]["filesystem"]
+    previous_fs.pop("/run/current-system/sw")
+    previous_fs.pop("/run/WSL")
+    previous_fs["/run"] = "deny"
+    refused = persistent_metadata_fixture.probe({"cwd": str(jobs[0].workspace_path), "config": previous})
+    assert refused == {"gate_passed": False, "native_exit_code": 1}
     cancels = [Event() for _ in jobs]
     results, errors = {}, []
     def run(number):
@@ -1117,6 +1136,7 @@ def test_real_persistent_native_owner_configuration_without_turns(native_policy,
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     policy = native_policy.policy
+    module.synthetic_platform(policy.root)
     source = Path(os.environ["ADF_TEST_CODEX_PATH"])
     vendor = policy.root / "tools" / "native-vendor"
     if launcher_mode == "node":

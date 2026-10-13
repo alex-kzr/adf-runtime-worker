@@ -134,7 +134,11 @@ class NativeReadPolicy:
         # Empty-root policy hides ungranted paths. Explicit deny ancestors of
         # read grants break the pinned Linux helper; mask only private siblings.
         filesystem = {":root": "deny", ":minimal": "read", "/etc": "deny", "/usr/local": "deny",
-                      "/nix": "deny", "/run": "deny", "/mnt": "deny", str(self.policy.profile): "deny",
+                      # The pinned SDK adds a /run/WSL tmpfs after filesystem masks.
+                      # A read-only /run ancestor prevents that mount. Root deny
+                      # hides other /run paths; mask its sole :minimal grant.
+                      "/nix": "deny", "/run/current-system/sw": "deny", "/run/WSL": "deny",
+                      "/mnt": "deny", str(self.policy.profile): "deny",
                       str(self.policy.manifest): "deny", str(self.manifest): "deny"}
         filesystem.update({str(self.policy.root / name): "deny"
                            for name in ("config", "providers", "provider-profiles", "journals", "locks", "projects", "skills")})
