@@ -1,3 +1,4 @@
+import copy
 import json
 from concurrent.futures import ThreadPoolExecutor
 import pytest
@@ -5,8 +6,15 @@ from adf_runtime_worker.models import WorkerError
 
 def commit_fixture(manager, workspace, job):
     evidence = manager.changes(workspace, job["allowed_write_paths"])
-    request = {**job, "review": {"approved": True, "reviewer_id": "reviewer", "developer_id": "developer", "tree_sha": evidence["tree_sha"]}, "test_results": [{"check_id": "check", "status": "passed", "tree_sha": evidence["tree_sha"]}]}
-    return manager.commit(workspace, request), request
+    request = {**job, "review": {"approved": True, "reviewer_id": "reviewer", "developer_id": "developer", "tree_sha": evidence["tree_sha"]}, "test_results": [{"check_id": "python", "status": "passed", "exit_code": 0, "tree_sha": evidence["tree_sha"]}]}
+    workspace.journal.update(request=copy.deepcopy(job), allowed_write_paths=job["allowed_write_paths"],
+                             developer_id="developer", review=request["review"], test_results=request["test_results"])
+    result = manager.commit(workspace, request)
+    dispatch_id = "published-" + workspace.execution_id
+    dispatch = {**request, "execution_id": dispatch_id, "operation": "git_commit", "target_execution_id": workspace.execution_id}
+    manager.journal_for(dispatch_id).update(execution_id=dispatch_id, request=dispatch, terminal_result={**result, "status": "succeeded"},
+                                            result_persisted=True, terminal_persisted=True)
+    return result, request
 
 def test_three_allocations_are_unique_and_preserve_main(manager, job, repository):
     _, repo, base, _ = repository

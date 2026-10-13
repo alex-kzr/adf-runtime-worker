@@ -1,3 +1,4 @@
+import copy
 import os
 import threading
 from threading import Event
@@ -16,11 +17,22 @@ pytestmark = pytest.mark.skipif(os.name != "posix", reason="Linux sealed profile
 
 def approved_commit(executor, job):
     executor.run(job, lambda *_: None, Event())
+    executor.workspaces.journal_for(job["execution_id"]).update(request=copy.deepcopy(job))
     common = {**job, "target_execution_id": job["execution_id"]}
     executor.run({**common, "execution_id": "checked", "operation": "test"}, lambda *_: None, Event())
     executor.run({**common, "execution_id": "reviewed", "operation": "review", "agent": {"id": "reviewer", "provider": "mock"},
                   "task_prompt": '{"review":{"approved":true,"findings":[]}}'}, lambda *_: None, Event())
     return common
+
+
+def commit_and_publish(executor, common):
+    writer = executor.workspaces.journal_for(common["target_execution_id"]).read()
+    request = {**common, "execution_id": "committed", "operation": "git_commit",
+               "review": writer["review"], "test_results": writer["test_results"]}
+    result = executor.run(request, lambda *_: None, Event())
+    executor.workspaces.journal_for(request["execution_id"]).update(execution_id=request["execution_id"], request=request,
+                                                                  terminal_result=result, result_persisted=True, terminal_persisted=True)
+    return result["commit_sha"]
 
 
 @pytest.mark.parametrize("operation", ["commit", "repair", "predecessor", "integrate"])
@@ -36,7 +48,7 @@ def test_drift_fences_commit_and_consumption_of_trusted_source(sealed_policy, jo
     source.update(shared_profile_policy=policy.receipt(generation), shared_workspace_seal=[list(identity[0]), identity[1]])
     sha = None
     if operation in {"predecessor", "integrate"}:
-        sha = executor.run({**common, "execution_id": "committed", "operation": "git_commit"}, lambda *_: None, Event())["commit_sha"]
+        sha = commit_and_publish(executor, common)
     state.update(policy_blocked=True)
     next_job = {**job, "execution_id": "fresh", "task_prompt": '{"mock_files":{"feature.py":"value = 43\\n"}}'}
     if operation == "commit":
@@ -68,7 +80,7 @@ def test_valid_receipt_follows_copies_and_blocks_after_retirement(sealed_policy,
     if operation == "repair":
         fresh["repair_source_execution_id"] = job["execution_id"]
     else:
-        sha = executor.run({**common, "execution_id": "committed", "operation": "git_commit"}, lambda *_: None, Event())["commit_sha"]
+        sha = commit_and_publish(executor, common)
         if operation == "predecessor":
             fresh["predecessor_commits"] = [sha]
         else:

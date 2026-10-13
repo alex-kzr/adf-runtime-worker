@@ -1,5 +1,7 @@
 # adf-runtime-worker
 
+The current source validates [accepted commit lineage](docs/accepted-commit-lineage.md) before dependency or integration imports. Durable published commit evidence is separated from fresh native execution authorization; retired grants remain fenced. The latest installed/native result is recorded in the matching [umbrella acceptance status](../../docs/acceptance-status.md). Earlier runtime statements below are dated history.
+
 Latest source regression: [public initialize/profile diagnosis](../../docs/public-initialize-diagnosis.md) proves that pinned app-server startup needs writable runtime state; a full-RO diagnostic profile fails before initialize. Three fresh-profile initialize-only cases and the existing pidfd fallback are checked. Production modules and locks remain unchanged; installed worker is0dd5ac7, real-profile acceptance remains incomplete and consumer stays stopped. Older deployment statements below are historical.
 
 ADF's Ubuntu WSL2 host execution service. It runs pinned Codex and Claude Code CLIs under the authenticated Linux user, consumes Redis Streams through a scoped API lease, supervises process groups, and owns task worktrees, checks, reviewed commits and serial integration. Provider authentication stays in the host home; this package has no Docker service.

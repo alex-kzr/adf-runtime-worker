@@ -367,8 +367,17 @@ def test_three_parallel_developers_failed_check_repair_review_commit_serial_inte
     monkeypatch.setattr(SharedCodexAdapter, "execute", lambda *_: AdapterResult("succeeded", 0, output='{"approved":true,"findings":[]}'))
     def execute(body):
         runner = Executor(repository[0], require_ext4=False, codex_backend="shared-patch", check_sandbox=checker_config)
-        return runner, runner.run(body, lambda *_: None, Event(), lease_deadline=lambda: time.monotonic() + 120)
+        journal = runner.workspaces.journal_for(body["execution_id"])
+        if body["operation"] == "git_commit":
+            writer = runner.workspaces.journal_for(body["target_execution_id"]).read()
+            body = {**body, "review": writer["review"], "test_results": writer["test_results"]}
+        journal.update(execution_id=body["execution_id"], request=body)
+        result = runner.run(body, lambda *_: None, Event(), lease_deadline=lambda: time.monotonic() + 120)
+        journal.update(terminal_result=result, result_persisted=True, terminal_persisted=True)
+        return runner, result
     jobs = [{**job, "execution_id": f"develop{index}", "task_id": f"task{index}", "allowed_write_paths": [f"feature{index}.py"],
+             "check_ids": ["value"],
+             "project": {**job["project"], "checks": [{"id": "value", "argv": ["python", "-c", f"from feature{index} import value; assert value == 42"], "timeout_sec": 15}]},
              "agent": {"id": "developer", "provider": "codex", "permission_profile": "trusted-development"}}
             for index in range(1, 4)]
     with ThreadPoolExecutor(max_workers=3) as pool:

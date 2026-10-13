@@ -217,7 +217,11 @@ class GitWorkspaceManager:
                 self.git(repo, "worktree", "add", "-b", branch, str(path), root_sha)
             if self.git(path, "status", "--porcelain"):
                 raise WorkerError("EXECUTION_UNCERTAIN", "New worktree is unexpectedly dirty")
-            journal.update(workspace={"path": str(path), "branch": branch, "root_base_sha": root_sha, "base_sha": root_sha}, phase="allocated", predecessor_commits=predecessors, dependency_snapshot_complete=False)
+            journal.update(workspace={"path": str(path), "branch": branch, "root_base_sha": root_sha, "base_sha": root_sha}, phase="allocated", predecessor_commits=predecessors, dependency_snapshot_complete=False,
+                           delta_authorization={"project_id": request["project_id"], "run_id": request["run_id"], "task_id": request["task_id"], "execution_id": execution_id,
+                                                "repository_root": str(repo), "approved": request.get("policy", {}).get("approved") is True,
+                                                "trusted_repository": request.get("policy", {}).get("trusted_repository") is True,
+                                                "selected_commits": request.get("integration_commits", []) if integration else predecessors})
             workspace = self.load(execution_id)
             for index, sha in enumerate(predecessors):
                 self._apply_delta(workspace, sha, f"dependency-{index}")
@@ -271,7 +275,9 @@ class GitWorkspaceManager:
         if not tests or any(item.get("status") != "passed" or item.get("tree_sha") != evidence["tree_sha"] for item in tests):
             raise WorkerError("TEST_REQUIRED", "Passing checks must bind the exact staged tree")
         with self.project_lock(request["project_id"]):
+            from .commit_lineage import validation
             saved = workspace.journal.read()
+            accepted = validation(saved, request, evidence["tree_sha"])
             existing = saved.get("commit_sha")
             if existing:
                 if self.git(workspace.path, "rev-parse", "HEAD") != existing:
@@ -282,7 +288,7 @@ class GitWorkspaceManager:
             if intent:
                 if head != intent["parent_sha"]:
                     self._verify_committed(workspace, intent)
-                    workspace.journal.update(commit_sha=head, phase="committed")
+                    workspace.journal.update(commit_sha=head, phase="committed", commit_validation=accepted)
                     return {**evidence, "commit_sha": head}
                 if intent["tree_sha"] != evidence["tree_sha"]:
                     raise WorkerError("EXECUTION_UNCERTAIN", "Commit intent tree changed")
@@ -294,7 +300,7 @@ class GitWorkspaceManager:
             self.git(workspace.path, "-c", "user.name=ADF Worker", "-c", "user.email=adf@localhost", "commit", "-m", intent["message"])
             self._verify_committed(workspace, intent)
             sha = self.git(workspace.path, "rev-parse", "HEAD")
-            workspace.journal.update(commit_sha=sha, phase="committed")
+            workspace.journal.update(commit_sha=sha, phase="committed", commit_validation=accepted)
             return {**evidence, "commit_sha": sha}
 
     def _verify_committed(self, workspace: Workspace, intent: Json) -> None:
@@ -306,7 +312,9 @@ class GitWorkspaceManager:
 
     def _apply_delta(self, workspace: Workspace, sha: str, key: str) -> str:
         from .profile_policy import check_receipt, inherit_receipt
-        inherit_receipt(self.root, workspace.journal, source_sha=sha)
+        from .commit_lineage import accepted_delta
+        if not accepted_delta(self, workspace, sha):
+            inherit_receipt(self.root, workspace.journal, source_sha=sha)
         check_receipt(self.root, workspace.journal.read())
         if not _SHA.fullmatch(sha):
             raise WorkerError("INVALID_REQUEST", "Integration requires exact commit IDs")

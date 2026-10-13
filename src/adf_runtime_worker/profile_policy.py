@@ -264,6 +264,8 @@ class SealedProfilePolicy:
 
 def check_receipt(root: Path, saved: dict[str, Any]) -> None:
     """Fence later checks/commits against a changed or retired generation."""
+    from .commit_lineage import check_import_fence
+    check_import_fence(root, saved)
     receipt = saved.get("shared_profile_policy")
     if receipt is None:
         return
