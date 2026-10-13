@@ -1,7 +1,7 @@
 {
   "orchestrator_commit": "9932a87e676b651c7ff2eb89246b900c6d0f843e",
   "capture_orchestrator_commit": "6fe7c1402864210fd8b6c2aed44695436c147f3f",
-  "request_builder_source_sha256": "a3b909a05cc4202b60a6c14fc1dfd1dabc802f1f57e7f548c5526904bd572825",
+  "request_builder_source_sha256": "0cfcb3d0079105f1da449e32beb7afaac77697dcf06f0a4958e48aaa5d15eeb5",
   "source": "src/adf_orchestrator/engine.py:WorkflowEngine.intent",
   "verification": "Retry safety classification changed; the captured request builder and envelope are unchanged. No new native run was performed.",
   "observed_run_id": "67398f61-5346-43c5-ba61-4be1ee0ba004",
